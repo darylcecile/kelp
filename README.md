@@ -2,31 +2,16 @@
 
 Local-first, change-oriented version control. Edit files, then publish; further publications update the same change.
 
-This monorepo contains a working **v0 prototype**. The [PRD](PRD/README.md) describes the broader product direction. Current commands and limits below describe what is implemented today.
+Kelp automatically keeps local checkpoints so you can recover earlier work. Use it entirely on your own machine, or connect a remote to share changes with others. This is an early release; see [current limits](#current-limits) below.
 
-## Workspace
+## Install
 
-```text
-apps/cli          kelp          Native command-line client
-apps/remote       kelp-remote   Self-hosted HTTP service
-crates/kelp-core                Shared objects, protocol types, content storage
-PRD/                           Product and architecture proposal
-```
+1. Download the archive for your system from [GitHub Releases](https://github.com/darylcecile/kelp/releases): Linux x86-64, macOS Intel/Apple Silicon, or Windows x86-64.
+2. Extract `kelp` (or `kelp.exe` on Windows).
+3. Move it into a directory on your `PATH`.
+4. Run `kelp --version` to check the installation.
 
-Both applications use Rust in one Cargo workspace. Rust offers native performance and memory safety; sharing the object model prevents the client and server from implementing different revision rules. The code uses conventional Clap, Axum, and SQLite components with synchronous domain logic and a small HTTP layer.
-
-## Build
-
-Prebuilt CLI binaries are available from [GitHub Releases](https://github.com/darylcecile/kelp/releases) for Linux x86-64, macOS Intel/Apple Silicon, and Windows x86-64. Extract the archive and put `kelp` (or `kelp.exe`) on your `PATH`. Each release includes `SHA256SUMS` for verifying downloads.
-
-Install [Rust through rustup](https://rustup.rs/), then:
-
-```sh
-cargo build --workspace --locked
-cargo install --path apps/cli --locked
-```
-
-The repository pins its Rust toolchain. SQLite is bundled; no separate database installation is needed. A C compiler is required for the bundled SQLite build.
+Each release includes `SHA256SUMS` for verifying downloads.
 
 ## Start entirely locally
 
@@ -51,20 +36,13 @@ kelp restore 1 --to ../recovered-project
 
 Automatic checkpoints start with `init` and `open`. They capture tracked bytes saved by your editor, not unsaved editor buffers. `kelp status` reports the watcher, and `.kelp/watch.log` contains capture errors. Use `kelp watch --stop` to stop the process, `kelp watch` to restart it, or `--no-watch` on `init`/`open` in automation. All checkpoints are retained in v0.
 
-## Run a remote and publish
+## Share a change
 
-From this repository, start the service:
-
-```sh
-export KELP_TOKEN="$(openssl rand -hex 32)"
-cargo run --package kelp-remote -- --data-dir ./data
-```
-
-In your project, set the same token in the client shell and attach the remote:
+Get a remote URL and access token from your remote's operator. In your project's shell:
 
 ```sh
-export KELP_TOKEN="<the token used by the server>"
-kelp remote set http://127.0.0.1:8080
+export KELP_TOKEN="<your access token>"
+kelp remote set https://code.example.com
 kelp publish -m "Fix checkout timeout"
 
 # Edit tracked files after feedback, then:
@@ -74,10 +52,14 @@ kelp changes
 
 The first publish creates the project on the remote and the change identity. Later publications keep that identity. Unchanged work reports “already published.” Failed publications retain their exact revision and request ID locally for retry. The access token is read from the environment and is not written into workspace metadata.
 
+In PowerShell, set the token with `$env:KELP_TOKEN = "<your access token>"` instead of `export`.
+
+## Open shared work
+
 Open a published change into a new directory using the change ID printed by publish:
 
 ```sh
-kelp open http://127.0.0.1:8080 ../review-copy \
+kelp open https://code.example.com ../review-copy \
   --project my-project --change <change-id>
 ```
 
@@ -85,29 +67,20 @@ An open change is editable and can be republished from either workspace. Concurr
 
 `kelp change new "Next task"` starts separate work based on the current files. `kelp remote remove` returns the workspace to local-only operation without deleting checkpoints. `--json` provides machine-readable command output, and `-C PATH` selects another working directory.
 
-## Deploy the remote
+## Current limits
 
-```sh
-export KELP_TOKEN="$(openssl rand -hex 32)"
-docker compose up --build -d
-curl http://127.0.0.1:8080/healthz
-```
+- Regular files up to 16 MiB, with UTF-8 paths. Symlinks are not supported yet.
+- Each checkpoint's file listing is limited to 2 MiB. Large-project optimizations are still in development.
+- `open` retrieves the selected change's base and result, not a full project mirror.
+- Merging, landing into shared channels, review approvals, Git import, and selecting individual hunks are not available yet.
 
-The image runs as a non-root user; a named volume persists `/data`. For deployment on another host, place it behind your HTTPS reverse proxy. Configuration is available through `KELP_LISTEN`, `KELP_DATA_DIR`, and `KELP_TOKEN`, or the corresponding CLI options. The token grants access to all projects on this instance.
+On Unix, executable bits are retained. Windows uses ordinary file permissions while preserving imported executable metadata.
 
-This is a **single-node SQLite remote**. Run one service instance per data directory. Stop it before copying the data directory for a simple consistent backup. SIGINT and SIGTERM drain HTTP requests before exit.
+## More help
 
-## Implemented scope
+Run `kelp --help` or `kelp <command> --help` for command options.
 
-- Local initialization, explicit tracking, automatic/named checkpoints, history, and recovery into a fresh directory.
-- One-command publication and revision updates, durable retries, divergent heads, and exact remote checkout.
-- Content-addressed objects, project-scoped storage, integrity verification, and atomic metadata updates.
-- Persistent authenticated HTTP service, container packaging, and cross-platform CI.
-
-The experimental `kelp/0` protocol uses deterministic JSON metadata, SHA-256 IDs, and whole-file blobs. It supports regular UTF-8-path files up to 16 MiB and snapshots up to 2 MiB of metadata. Local capture scans tracked files; this is not yet the PRD's large-project implementation.
-
-Channels/landing, review approvals, merge resolution, Git import, selective hunks, sparse fetching, native bundles, signing, symlinks, chunking, retention policies, and distributed storage are future milestones. `open` retrieves a selected change's base and result, not a full project mirror. On Unix, executable bits are retained; Windows checkouts use ordinary file permissions while preserving imported executable metadata.
-
-## Contribute
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and checks, and [the remote API](apps/remote/README.md) for interoperability.
+- [Report a problem](https://github.com/darylcecile/kelp/issues)
+- [Host a remote](apps/remote/README.md)
+- [Development and source builds](CONTRIBUTING.md)
+- [Product roadmap](PRD/README.md)

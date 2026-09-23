@@ -1,6 +1,12 @@
 # Kelp remote
 
-An Axum HTTP service backed by one SQLite database. Run with `cargo run -p kelp-remote`; set `KELP_TOKEN` first. See the [root README](../../README.md) for Docker deployment.
+Kelp's self-hosted HTTP service stores projects in one SQLite database. See [the contribution guide](../../CONTRIBUTING.md#run-the-remote) to build and launch the service or its container.
+
+## Operate a remote
+
+Configure the service through `KELP_LISTEN`, `KELP_DATA_DIR`, and `KELP_TOKEN`, or the corresponding CLI options. The token grants access to all projects on this instance. Place the service behind an HTTPS reverse proxy when deploying it on another host.
+
+The container runs as a non-root user, and the Compose configuration persists `/data` in a named volume. Run one service instance per data directory. Stop it before copying that directory for a simple consistent backup. SIGINT and SIGTERM drain HTTP requests before exit.
 
 ## v0 API
 
