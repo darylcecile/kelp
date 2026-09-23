@@ -36,7 +36,40 @@ pub fn start(workspace: &Workspace) -> Result<()> {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
+    #[cfg(windows)]
+    prevent_stdio_inheritance()?;
     command.spawn()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn prevent_stdio_inheritance() -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    };
+
+    // Redirecting the child's stdio does not clear inheritance on our original
+    // pipe handles. Those extra copies would keep a caller's output() waiting.
+    for handle in [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ] {
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        // SAFETY: These handles are borrowed from the process's live standard
+        // streams. This changes an inheritance flag without closing the handle.
+        #[expect(
+            unsafe_code,
+            reason = "the stable standard library has no handle-inheritance setter"
+        )]
+        let result = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+        if result == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
     Ok(())
 }
 

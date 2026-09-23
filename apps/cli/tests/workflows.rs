@@ -10,13 +10,24 @@ use kelp_core::{PublicationReceipt, Revision, storage};
 use serde_json::Value;
 
 fn command(directory: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_kelp"))
-        .arg("--directory")
-        .arg(directory)
-        .arg("--json")
-        .args(args)
-        .env("KELP_TOKEN", "test-token")
-        .output()
+    let directory = directory.to_owned();
+    let arguments: Vec<_> = args.iter().map(|arg| (*arg).to_owned()).collect();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let output = Command::new(env!("CARGO_BIN_EXE_kelp"))
+            .arg("--directory")
+            .arg(directory)
+            .arg("--json")
+            .args(arguments)
+            .env("KELP_TOKEN", "test-token")
+            .output();
+        let _ = sender.send(output);
+    });
+    receiver
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|_| {
+            panic!("kelp {args:?} did not return and close its output pipes within 30 seconds")
+        })
         .expect("start kelp")
 }
 
