@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Build CLI
+        shell: bash
+        run: cargo build --locked --release --package kelp-cli --bin kelp --target "$TARGET"
+      - name: Verify version and package CLI
+        shell: python
+        run: |
+          import os
+          import pathlib
+          import subprocess
+          import tarfile
+          import zipfile
+
+          target = os.environ["TARGET"]
+          tag = os.environ["RELEASE_TAG"]
+          windows = target.endswith("windows-msvc")
+          binary = pathlib.Path("target") / target / "release" / ("kelp.exe" if windows else "kelp")
+          version = subprocess.check_output([str(binary), "--version"], text=True).strip()
+          if version != f"kelp {tag.removeprefix('v')}":
+              raise SystemExit(f"Tag {tag} does not match binary version: {version}")
+
+          pathlib.Path("dist").mkdir()
+          archive = pathlib.Path("dist") / f"kelp-{tag}-{target}"
+          if windows:
+              with zipfile.ZipFile(f"{archive}.zip", "w", zipfile.ZIP_DEFLATED) as output:
+                  output.write(binary, binary.name)
+          else:
+              with tarfile.open(f"{archive}.tar.gz", "w:gz") as output:
+                  output.add(binary, arcname=binary.name)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: kelp-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: kelp-*
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum kelp-* > SHA256SUMS
+      - name: Create release with CLI downloads
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: >-
+          gh release create "$RELEASE_TAG" dist/*
+          --repo "$GH_REPO"
+          --verify-tag
+          --title "Kelp $RELEASE_TAG"
+          --generate-notes

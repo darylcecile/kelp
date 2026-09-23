@@ -1,0 +1,16 @@
+node_modules
+.DS_Store
+dist
+dist-ssr
+*.local
+.env
+.nitro
+.tanstack
+.output
+.vinxi
+__unconfig*
+
+# Rust and Kelp runtime data
+/target/
+.kelp/
+/data/

@@ -1,0 +1,15 @@
+services:
+  remote:
+    build:
+      context: .
+      dockerfile: apps/remote/Dockerfile
+    environment:
+      KELP_TOKEN: ${KELP_TOKEN:?Set KELP_TOKEN before starting the remote}
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - kelp-data:/data
+    init: true
+
+volumes:
+  kelp-data:
