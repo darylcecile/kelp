@@ -1,0 +1,44 @@
+x-storage: &storage
+  image: kelp-remote:development
+  build:
+    context: .
+    dockerfile: apps/remote/Dockerfile
+  command: ["--storage-only"]
+  environment:
+    KELP_TOKEN: ${KELP_STORAGE_TOKEN:?Set KELP_STORAGE_TOKEN for private storage traffic}
+  init: true
+
+services:
+  remote:
+    image: kelp-remote:development
+    build:
+      context: .
+      dockerfile: apps/remote/Dockerfile
+    environment:
+      KELP_TOKEN: ${KELP_TOKEN:?Set KELP_TOKEN for CLI access}
+      KELP_STORAGE_TOKEN: ${KELP_STORAGE_TOKEN:?Set KELP_STORAGE_TOKEN for private storage traffic}
+      KELP_SHARDS: http://storage-a:8080,http://storage-b:8080,http://storage-c:8080
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      - storage-a
+      - storage-b
+      - storage-c
+    init: true
+  storage-a:
+    <<: *storage
+    volumes:
+      - storage-a:/data
+  storage-b:
+    <<: *storage
+    volumes:
+      - storage-b:/data
+  storage-c:
+    <<: *storage
+    volumes:
+      - storage-c:/data
+
+volumes:
+  storage-a:
+  storage-b:
+  storage-c:

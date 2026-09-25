@@ -1,0 +1,10 @@
+{
+  "before": {
+    "kelp": "2e32a0c3dfd89e1e86c805e12fdd7ccc09a6c7832a86f132579aca60c9ff45dc",
+    "kelp-remote": "fc55937ff411fb81160628b20b3ba7f44cd11ca6c73bb7c9f828f1d38bcb3d55"
+  },
+  "after": {
+    "kelp": "a72a4386e1dd114a5f26d593186f71948c1831044036a216fa77d76da2cfa46a",
+    "kelp-remote": "0c7ee6be6e4c47c206da22d3b12bf7c70b6388432628101688119621a66d54ee"
+  }
+}

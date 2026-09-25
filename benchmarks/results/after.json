@@ -1,0 +1,57 @@
+{
+  "environment": {
+    "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "cpu_count": 16,
+    "git": "git version 2.54.0 (Apple Git-157)",
+    "kelp": "kelp 0.0.1"
+  },
+  "fixture": {
+    "files": 1000,
+    "bytes": 4096,
+    "history": 100,
+    "samples": 15
+  },
+  "scope": "Warm filesystem cache, local SSD, separate command processes. Git add+commit vs Kelp commit. No network, fsmonitor daemon, sparse checkout, or production scale-out claims.",
+  "git": {
+    "initial_commit_ms": 497.337,
+    "status_short_history": {
+      "median_ms": 13.69,
+      "p95_ms": 15.096,
+      "samples": 15
+    },
+    "status_long_history": {
+      "median_ms": 13.137,
+      "p95_ms": 13.729,
+      "samples": 15
+    },
+    "incremental_commit": {
+      "median_ms": 37.888,
+      "p95_ms": 48.708,
+      "samples": 100
+    },
+    "metadata_bytes": 604581,
+    "after_maintenance_bytes": 330075,
+    "metadata_note": "Git retains versions; Kelp also retains complete local recovery snapshots. Not identical storage semantics."
+  },
+  "kelp": {
+    "initial_commit_ms": 27281.738,
+    "status_short_history": {
+      "median_ms": 16.726,
+      "p95_ms": 27.936,
+      "samples": 15
+    },
+    "status_long_history": {
+      "median_ms": 16.493,
+      "p95_ms": 19.116,
+      "samples": 15
+    },
+    "incremental_commit": {
+      "median_ms": 30.386,
+      "p95_ms": 37.616,
+      "samples": 100
+    },
+    "metadata_bytes": 5300224,
+    "after_maintenance_bytes": null,
+    "metadata_note": "Git retains versions; Kelp also retains complete local recovery snapshots. Not identical storage semantics."
+  }
+}

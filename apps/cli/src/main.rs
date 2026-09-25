@@ -1,11 +1,10 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use kelp_cli::{
-    remote::{Remote, normalize_url},
-    watch,
-    workspace::{Workspace, materialize},
+    remote::{Remote, project_location, project_url},
+    workspace::{FileDiff, Resolution, Workspace},
 };
 use serde::Serialize;
 
@@ -24,92 +23,70 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Create a local workspace; no server or account is required.
+    /// Start a project locally. No account or remote needed.
     Init {
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Project name (defaults to the directory name).
         #[arg(long)]
         project: Option<String>,
+        /// Optional project URL, such as https://code.example.com/my-project.
         #[arg(long)]
         remote: Option<String>,
-        /// Do not start the automatic checkpoint process (useful in CI).
-        #[arg(long)]
-        no_watch: bool,
     },
-    /// Show local edits, untracked files, and the active change.
+    /// Download a shared project and its saved history.
+    Clone {
+        url: String,
+        /// Destination directory (defaults to the project name).
+        path: Option<PathBuf>,
+    },
+    /// Show uncommitted files and commits ready to push.
     Status,
-    /// Include new files or directories in future checkpoints and publications.
-    Track {
-        #[arg(required = true)]
-        paths: Vec<PathBuf>,
-    },
-    /// Mark an optional named local checkpoint.
-    Checkpoint {
+    /// Preview edits not yet committed.
+    Diff,
+    /// Save a described version locally, without sharing it.
+    Commit {
         #[arg(short, long)]
-        message: Option<String>,
+        message: String,
     },
-    /// List local checkpoints, newest first.
+    /// Send committed work to the remote. Leaves uncommitted edits local.
+    Push { url: Option<String> },
+    /// Get remote updates, preserving independent local edits.
+    Pull {
+        /// Keep your files where both sides edited the same path.
+        #[arg(long, conflicts_with = "keep_remote")]
+        keep_local: bool,
+        /// Use remote files where both sides edited the same path.
+        #[arg(long)]
+        keep_remote: bool,
+    },
+    /// List saved versions, their descriptions, and changed files.
     Log {
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// List edit transactions, in dependency order.
+        #[arg(long)]
+        commits: bool,
     },
-    /// Recover a checkpoint's files into a new directory.
-    Restore {
-        checkpoint: i64,
-        #[arg(long)]
-        to: PathBuf,
-    },
-    /// Capture and share current work, or update the same change after feedback.
-    Publish {
-        #[arg(short, long)]
-        message: Option<String>,
-    },
-    /// List changes on the configured remote.
-    Changes,
-    /// Open a remote change as a new local workspace.
-    Open {
-        url: String,
-        path: PathBuf,
-        #[arg(long)]
-        project: String,
-        #[arg(long)]
-        change: String,
-        #[arg(long)]
-        revision: Option<String>,
-        #[arg(long)]
-        no_watch: bool,
-    },
-    /// Configure a remote, or return to local-only operation.
+    /// Show a saved view or commit by hash (unique prefixes are accepted).
+    Show { version: String },
+    /// Restore a complete saved view by hash, keeping a backup of current work.
+    Restore { view: String },
+    /// Compact local storage without deleting commits or recovery views.
+    Gc,
+    /// Show or configure the remote project URL.
     Remote {
         #[command(subcommand)]
-        command: RemoteCommand,
+        command: Option<RemoteCommand>,
     },
-    /// Start a separate piece of work.
-    Change {
-        #[command(subcommand)]
-        command: ChangeCommand,
-    },
-    /// Start automatic local checkpoints, or stop them with --stop.
-    Watch {
-        #[arg(long)]
-        stop: bool,
-    },
-    #[command(name = "_watch", hide = true)]
-    WatchWorker,
 }
 
 #[derive(Subcommand)]
 enum RemoteCommand {
-    /// Attach a server without uploading anything.
+    /// Remember a project URL without uploading anything.
     Set { url: String },
-    /// Detach the server while keeping all local history.
+    /// Work locally, keeping all saved versions.
     Remove,
-}
-
-#[derive(Subcommand)]
-enum ChangeCommand {
-    /// Start new work based on the current files; previous checkpoints remain.
-    New { message: String },
 }
 
 fn emit(json: bool, value: &impl Serialize, human: impl std::fmt::Display) -> Result<()> {
@@ -121,13 +98,39 @@ fn emit(json: bool, value: &impl Serialize, human: impl std::fmt::Display) -> Re
     Ok(())
 }
 
+fn token() -> Result<String> {
+    std::env::var("KELP_TOKEN")
+        .context("set KELP_TOKEN to the access token supplied by your remote's operator")
+}
+
 fn client(workspace: &Workspace) -> Result<Remote> {
-    let url = workspace.state.remote.as_deref().context("this is a local-only workspace; attach a remote with `kelp remote set URL` when you want to publish")?;
+    let url = workspace.state.remote.as_deref().context("no remote configured; use `kelp push URL` to share, or `kelp commit -m \"Description\"` to save locally")?;
     Remote::new(url, &workspace.state.project, token()?)
 }
 
-fn token() -> Result<String> {
-    std::env::var("KELP_TOKEN").context("set KELP_TOKEN to the remote's access token")
+fn location(workspace: &Workspace) -> Option<String> {
+    workspace
+        .state
+        .remote
+        .as_ref()
+        .map(|base| project_url(base, &workspace.state.project))
+}
+
+fn display_diff(json: bool, files: Vec<FileDiff>) -> Result<()> {
+    let text = files
+        .iter()
+        .map(|file| format!("{} {}\n{}", file.file.kind, file.file.path, file.diff))
+        .collect::<Vec<_>>()
+        .join("\n");
+    emit(
+        json,
+        &files,
+        if text.is_empty() {
+            "No file changes."
+        } else {
+            text.trim_end()
+        },
+    )
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -140,240 +143,283 @@ fn run(cli: Cli) -> Result<()> {
             path,
             project,
             remote,
-            no_watch,
         } => {
             let path = directory.join(path);
             std::fs::create_dir_all(&path)?;
             let path = path.canonicalize()?;
-            let project = project
-                .or_else(|| {
+            let (base, project) = if let Some(url) = remote {
+                let (base, name) = project_location(&url)?;
+                ensure!(
+                    project.as_ref().is_none_or(|project| *project == name),
+                    "--project must match the project in the remote URL"
+                );
+                (Some(base), name)
+            } else {
+                let name = project.unwrap_or_else(|| {
                     path.file_name()
-                        .and_then(|name| name.to_str())
-                        .map(str::to_owned)
-                })
-                .context("supply --project NAME")?;
-            let remote = remote.as_deref().map(normalize_url).transpose()?;
-            let workspace = Workspace::init(&path, &project, remote)?;
-            if !no_watch {
-                watch::start(&workspace)?;
-            }
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .chars()
+                        .map(|c| {
+                            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                                c
+                            } else {
+                                '-'
+                            }
+                        })
+                        .collect()
+                });
+                (None, name)
+            };
+            let workspace = Workspace::init(&path, &project, base)?;
             emit(
                 cli.json,
-                &workspace.state,
+                &serde_json::json!({"project": project, "directory": path, "remote": location(&workspace)}),
                 format!(
-                    "Initialized {} in {}.\nExisting non-ignored files are tracked. {}",
-                    project,
-                    path.display(),
-                    if no_watch {
-                        "Automatic checkpoints are stopped."
-                    } else {
-                        "Automatic local checkpoints started."
-                    }
+                    "Initialized Kelp in {}.\nEdit files, commit locally, and push when ready to share.",
+                    path.display()
                 ),
             )
         }
-        Commands::Open {
-            url,
-            path,
-            project,
-            change,
-            revision,
-            no_watch,
-        } => {
-            let remote = Remote::new(&url, &project, token()?)?;
-            let workspace = remote.open(
-                &url,
-                &project,
-                &change,
-                revision.as_deref(),
-                &directory.join(path),
-            )?;
-            if !no_watch {
-                watch::start(&workspace)?;
-            }
+        Commands::Clone { url, path } => {
+            let (base, project) = project_location(&url)?;
+            let remote = Remote::new(&base, &project, token()?)?;
+            let destination = directory.join(path.unwrap_or_else(|| PathBuf::from(&project)));
+            let workspace = remote.clone_project(&base, &project, &destination)?;
             emit(
                 cli.json,
-                &workspace.state,
-                format!("Opened change {change} in {}", workspace.root.display()),
+                &serde_json::json!({"project": project, "directory": workspace.root, "remote": location(&workspace)}),
+                format!("Cloned {project} into {}.", workspace.root.display()),
             )
         }
-        Commands::WatchWorker => watch::run(&directory),
         command => {
             let mut workspace = Workspace::open(&directory)?;
             match command {
                 Commands::Status => {
-                    let status = workspace.status()?;
-                    let title = status
-                        .message
-                        .as_deref()
-                        .unwrap_or("New work (not yet named)");
+                    let mut status = workspace.status()?;
+                    status.remote = location(&workspace);
                     let mut text = format!(
-                        "{title}\nProject: {}\nRemote: {}\nAutomatic checkpoints: {}\n",
+                        "Project: {}\nRemote: {}\n",
                         status.project,
-                        status.remote.as_deref().unwrap_or("local only"),
-                        if status.watcher_running {
-                            "running"
-                        } else {
-                            "stopped or starting"
-                        }
+                        status.remote.as_deref().unwrap_or("local only")
                     );
-                    if let Some(change) = &status.change {
-                        text.push_str(&format!("Change: {change}\n"));
+                    if let Some(version) = &status.version {
+                        text.push_str(&format!(
+                            "Last saved view: {}\n",
+                            workspace.short_hash(version)?
+                        ));
+                    } else {
+                        text.push_str("No saved versions yet.\n");
                     }
-                    if let Some(id) = status.checkpoint {
-                        text.push_str(&format!("Latest checkpoint: {id}\n"));
-                    }
-                    if status.pending {
-                        text.push_str("Publication pending; run kelp publish to retry.\n");
+                    if status.pending_commits != 0 {
+                        text.push_str(&format!(
+                            "{} committed version(s) ready to push.\n",
+                            status.pending_commits
+                        ));
                     }
                     for path in &status.changed {
-                        text.push_str(&format!("  edited  {path}\n"));
-                    }
-                    for path in &status.untracked {
-                        text.push_str(&format!("  untracked  {path}\n"));
+                        text.push_str(&format!("  uncommitted  {path}\n"));
                     }
                     if status.changed.is_empty() {
-                        text.push_str("No edits since the last publication or base.\n");
+                        text.push_str("No uncommitted edits.\n");
+                    }
+                    if !status.conflicts.is_empty() {
+                        text.push_str(&format!(
+                            "Commit a resolution for: {}\n",
+                            status
+                                .conflicts
+                                .iter()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
                     }
                     emit(cli.json, &status, text.trim_end())
                 }
-                Commands::Track { paths } => {
-                    let count = workspace.track(&paths, &directory)?;
-                    emit(
-                        cli.json,
-                        &serde_json::json!({"tracked": count}),
-                        format!("Tracking {count} new files."),
-                    )
+                Commands::Diff => display_diff(cli.json, workspace.diff()?),
+                Commands::Show { version } => {
+                    display_diff(cli.json, workspace.show_reference(&version)?)
                 }
-                Commands::Checkpoint { message } => {
-                    let checkpoint = workspace.capture(message.as_deref())?;
+                Commands::Commit { message } => {
+                    let version = workspace.commit(&message)?;
                     emit(
                         cli.json,
-                        &checkpoint,
+                        &version,
                         format!(
-                            "Local checkpoint {}: {}",
-                            checkpoint.id, checkpoint.snapshot
+                            "Commit {}: {message}\nSaved view {} — use this hash to restore the complete project.",
+                            workspace.short_hash(
+                                version
+                                    .transaction
+                                    .as_ref()
+                                    .context("commit ID is missing")?
+                            )?,
+                            workspace.short_hash(&version.view)?
                         ),
                     )
                 }
-                Commands::Log { limit } => {
-                    let checkpoints = workspace.checkpoints(limit.min(1000))?;
-                    let text = checkpoints
-                        .iter()
-                        .map(|c| {
-                            format!(
-                                "{}  {}  {}",
-                                c.id,
-                                &c.snapshot[..12],
-                                c.message.as_deref().unwrap_or("Automatic checkpoint")
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    emit(cli.json, &checkpoints, text)
-                }
-                Commands::Restore { checkpoint, to } => {
-                    let snapshot = workspace.checkpoint_snapshot(checkpoint)?;
-                    let to = directory.join(to);
-                    materialize(&workspace.db, &workspace.state.project, &snapshot, &to)?;
-                    emit(
-                        cli.json,
-                        &serde_json::json!({"checkpoint": checkpoint, "destination": to}),
-                        format!("Recovered checkpoint {checkpoint} to {}", to.display()),
-                    )
-                }
-                Commands::Publish { message } => {
-                    let remote = client(&workspace)?;
-                    if let Some(pending) = workspace.state.pending.clone() {
-                        let receipt = remote.publish(&workspace, &pending)?;
-                        workspace.acknowledge(&pending)?;
-                        if !cli.json {
-                            println!("Confirmed pending revision {}", receipt.revision);
-                        }
-                    }
-                    match workspace.prepare_publication(message.as_deref())? {
-                        Some(publication) => {
-                            let receipt = remote.publish(&workspace, &publication)?;
-                            workspace.acknowledge(&publication)?;
-                            emit(
-                                cli.json,
-                                &receipt,
-                                format!(
-                                    "Published change {}\nRevision: {}\n{}",
-                                    receipt.change,
-                                    receipt.revision,
-                                    if receipt.heads.len() > 1 {
-                                        "This change has divergent revisions; all contributions are retained."
-                                    } else {
-                                        "Edit and run kelp publish again to update this change."
-                                    }
-                                ),
-                            )
-                        }
-                        None => emit(
-                            cli.json,
-                            &serde_json::json!({"state": "already_published", "change": workspace.state.change, "revision": workspace.state.head}),
-                            "Already published; no new edits.",
-                        ),
-                    }
-                }
-                Commands::Changes => {
-                    let changes = client(&workspace)?.changes()?;
-                    let text = changes
-                        .iter()
-                        .map(|change| {
-                            format!("{}  {} revision head(s)", change.change, change.heads.len())
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    emit(cli.json, &changes, text)
-                }
-                Commands::Remote { command } => {
-                    workspace.state.remote = match command {
-                        RemoteCommand::Set { url } => Some(normalize_url(&url)?),
-                        RemoteCommand::Remove => None,
-                    };
-                    workspace.save_state()?;
-                    emit(
-                        cli.json,
-                        &serde_json::json!({"remote": workspace.state.remote}),
-                        format!(
-                            "Remote: {}",
-                            workspace.state.remote.as_deref().unwrap_or("local only")
-                        ),
-                    )
-                }
-                Commands::Change {
-                    command: ChangeCommand::New { message },
+                Commands::Log {
+                    limit,
+                    commits: true,
                 } => {
-                    workspace.new_change(message.clone())?;
+                    let graph = workspace.graph()?;
+                    let entries: Vec<_> = graph.ordered()?.into_iter().rev().take(limit.min(1000)).map(|id| {
+                        let transaction = &graph.transactions[&id];
+                        serde_json::json!({"commit": id, "message": transaction.message, "files": transaction.edits.keys().collect::<Vec<_>>()})
+                    }).collect();
+                    let text = entries
+                        .iter()
+                        .map(|entry| -> Result<String> {
+                            Ok(format!(
+                                "{}  {}\n   {}",
+                                workspace.short_hash(entry["commit"].as_str().unwrap())?,
+                                entry["message"].as_str().unwrap(),
+                                entry["files"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .map(|path| path.as_str().unwrap())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ))
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                        .join("\n");
                     emit(
                         cli.json,
-                        &workspace.state,
-                        format!(
-                            "Started separate work: {message}\nCurrent files are the base; make edits and publish when ready."
-                        ),
-                    )
-                }
-                Commands::Watch { stop } => {
-                    if stop {
-                        watch::stop(&workspace)?;
-                    } else {
-                        watch::start(&workspace)?;
-                    }
-                    emit(
-                        cli.json,
-                        &serde_json::json!({"enabled": !stop}),
-                        if stop {
-                            "Automatic checkpoints stopping."
+                        &entries,
+                        if text.is_empty() {
+                            "No commits yet."
                         } else {
-                            "Automatic checkpoints started."
+                            &text
                         },
                     )
                 }
-                Commands::Init { .. } | Commands::Open { .. } | Commands::WatchWorker => {
-                    unreachable!()
+                Commands::Log {
+                    limit,
+                    commits: false,
+                } => {
+                    let history = workspace.history(limit.min(1000))?;
+                    let text = history
+                        .iter()
+                        .map(|entry| -> Result<String> {
+                            let hash = workspace.short_hash(&entry.version.view)?;
+                            let mut text = format!(
+                                "{}  {}\n",
+                                hash,
+                                entry.version.message.as_deref().unwrap_or("Saved version")
+                            );
+                            for file in entry.files.iter().take(5) {
+                                text.push_str(&format!("   {} {}\n", file.kind, file.path));
+                            }
+                            if entry.files.len() > 5 {
+                                text.push_str(&format!(
+                                    "   + {} more; kelp show {}\n",
+                                    entry.files.len() - 5,
+                                    hash
+                                ));
+                            }
+                            Ok(text)
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                        .join("\n");
+                    emit(
+                        cli.json,
+                        &history,
+                        if text.is_empty() {
+                            "No saved versions yet."
+                        } else {
+                            text.trim_end()
+                        },
+                    )
                 }
+                Commands::Restore { view } => {
+                    let (restored, backup) = workspace.restore_reference(&view)?;
+                    emit(
+                        cli.json,
+                        &serde_json::json!({"restored": restored, "backup": backup}),
+                        format!(
+                            "Restored view {} in this folder.\nPrevious work is saved as view {}.",
+                            workspace.short_hash(&restored)?,
+                            workspace.short_hash(&backup)?
+                        ),
+                    )
+                }
+                Commands::Gc => {
+                    let report = workspace.compact()?;
+                    emit(
+                        cli.json,
+                        &report,
+                        format!(
+                            "Compacted storage for {} objects ({} packed groups).\nStored object payload: {} → {} bytes. All history retained.",
+                            report.objects,
+                            report.packs,
+                            report.payload_before,
+                            report.payload_after
+                        ),
+                    )
+                }
+                Commands::Push { url } => {
+                    if let Some(url) = url {
+                        let (base, project) = project_location(&url)?;
+                        workspace.set_remote(base, project)?;
+                    }
+                    let remote = client(&workspace)?;
+                    let count = remote.push(&mut workspace)?;
+                    emit(
+                        cli.json,
+                        &serde_json::json!({"pushed": count, "view": workspace.projection()?.id()?, "remote": location(&workspace)}),
+                        if count == 0 {
+                            "No committed work to push. Use `kelp commit -m \"Description\"` to save edits first.".to_owned()
+                        } else {
+                            format!(
+                                "Pushed {count} committed version(s) to {}.",
+                                location(&workspace).unwrap_or_default()
+                            )
+                        },
+                    )
+                }
+                Commands::Pull {
+                    keep_local,
+                    keep_remote,
+                } => {
+                    let resolution = if keep_local {
+                        Resolution::Local
+                    } else if keep_remote {
+                        Resolution::Remote
+                    } else {
+                        Resolution::Stop
+                    };
+                    let updated = client(&workspace)?.pull(&mut workspace, resolution)?;
+                    emit(
+                        cli.json,
+                        &serde_json::json!({"updated": updated, "view": workspace.projection()?.id()?}),
+                        if updated {
+                            "Pulled updates. Your independent edits are preserved."
+                        } else {
+                            "Up to date."
+                        },
+                    )
+                }
+                Commands::Remote { command } => {
+                    match command {
+                        Some(RemoteCommand::Set { url }) => {
+                            let (base, project) = project_location(&url)?;
+                            workspace.set_remote(base, project)?;
+                        }
+                        Some(RemoteCommand::Remove) => {
+                            workspace.state.remote = None;
+                            workspace.save_state()?;
+                        }
+                        None => {}
+                    }
+                    let remote = location(&workspace);
+                    emit(
+                        cli.json,
+                        &serde_json::json!({"remote": remote}),
+                        format!("Remote: {}", remote.as_deref().unwrap_or("local only")),
+                    )
+                }
+                Commands::Init { .. } | Commands::Clone { .. } => unreachable!(),
             }
         }
     }

@@ -1,6 +1,10 @@
-//! HTTP service and transactional publication logic for a single-node remote.
+//! Transaction gateways, storage nodes, and the standalone compatibility API.
 
+mod backend;
 mod database;
+mod graph_api;
+
+pub use graph_api::{cluster_app, storage_app};
 
 use std::{
     path::Path,
@@ -52,6 +56,8 @@ enum Error {
     Missing(String),
     #[error("{0}")]
     Conflict(String),
+    #[error("{0}")]
+    Unavailable(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -62,6 +68,7 @@ impl IntoResponse for Error {
             Self::Invalid(_) => (StatusCode::BAD_REQUEST, "INVALID_REQUEST"),
             Self::Missing(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
             Self::Conflict(_) => (StatusCode::CONFLICT, "CONFLICT"),
+            Self::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE"),
             Self::Internal(error) => {
                 tracing::error!(error = ?error, "request failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR")
@@ -88,6 +95,7 @@ pub fn app(data_dir: &Path, token: String) -> anyhow::Result<Router> {
     anyhow::ensure!(!token.trim().is_empty(), "KELP_TOKEN must not be empty");
     std::fs::create_dir_all(data_dir)?;
     let db = database::open(&data_dir.join("kelp.sqlite3"))?;
+    let transactions = graph_api::local_app(data_dir, token.clone())?;
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
         token: token.into(),
@@ -109,7 +117,8 @@ pub fn app(data_dir: &Path, token: String) -> anyhow::Result<Router> {
     Ok(Router::new()
         .route("/healthz", get(|| async { "ok\n" }))
         .merge(api)
-        .with_state(state))
+        .with_state(state)
+        .merge(transactions))
 }
 
 async fn authenticate(State(state): State<AppState>, request: Request, next: Next) -> Response {

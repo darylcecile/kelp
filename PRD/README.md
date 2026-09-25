@@ -1,84 +1,72 @@
-# Kelp: a change-first successor to Git
+# Kelp: independent changes, distributed storage
 
-- **Status:** proposal for review, not an implemented system
-- **Research date:** 23 September 2026
-- **Working name:** Kelp; proposed command: `kelp`
+**Updated:** 24 September 2026
 
-## The proposal in one minute
+## The goal and the primitive
 
-Kelp is a local-first version-control system built around **changes that keep their identity**, **exact snapshots that builds can reproduce**, and **storage that can split one project across many machines**.
-
-In Git, people usually collaborate by moving branches through a history of commits. In Kelp, people edit normally, then run `kelp publish -m "Fix checkout timeout"`. That one command creates the change identity, records an exact revision, and shares it. After feedback, another `kelp publish` updates the same change without losing its identity or discussion.
+Kelp versions **atomic edit transactions**. Each transaction describes what it writes and which earlier versions of those files it replaces. It is not a whole-project snapshot with a parent chosen from a single project history.
 
 ```text
-Edit files → Publish → Review → Land
-    │                     │       │
-Automatic local       Edit and    Exact snapshot
-checkpoints           republish   for CI and releases
+Initial commit T0: api.txt + ui.txt
+                  /             \
+T1: update api.txt               T2: update ui.txt
+depends on api.txt in T0         depends on ui.txt in T0
+                  \             /
+          view containing {T0, T1, T2}
+          api from T1, ui from T2
 ```
 
-Underneath, immutable content is stored in independently fetchable pieces. Small records say which changes and snapshots are current. A laptop can hold everything for a small project, or only its selected working set in a huge one. A server can distribute one project's content and metadata across storage nodes.
+T1 and T2 can be committed offline and pushed through different servers. Their IDs do not change. Combining them requires no new merge commit or project-head update. A snapshot is a reproducible **view of a dependency-closed transaction set**.
 
-**Local-only is a complete starting mode.** `kelp init` creates a workspace without a server, account, or network connection. Checkpoints, history, and recovery operate locally. A remote can be attached later with `kelp remote set URL`; attaching it does not upload anything.
+If two transactions replace the same file version differently, both values remain in the model. Resolving the conflict creates another transaction that explicitly consumes both alternatives. Convergence means replicas agree about the values and conflicts; it does not mean every program is correct.
 
-**The primitive to replace is not hashing or snapshots. It is the coupling of a unit of work to its position in a repository-wide commit history, and of a logical project to a repository-shaped storage/transfer unit.**
+This draws on change-oriented VCS and replicated-data ideas already explored by Pijul and others. The proposed contribution is the integrated user workflow, transaction contract, and partitioned service, not a claim of inventing change algebra. [Research](01-research.md).
 
-## What actually changes?
+## Familiar interface, different foundation
 
-| Question | Git's native model | Proposed Kelp model |
-| --- | --- | --- |
-| What am I working on? | A branch, working tree, index, and commits | Workspace edits; a change is named on first publish |
-| How is unfinished work retained? | Explicit commits/stashes; local reflogs for reference movements | Automatic local checkpoints; optional named checkpoints |
-| What happens when I revise it? | New commit IDs; external tools track continuity | Same change ID, new immutable revision |
-| What gets reviewed? | Usually a host's pull request over commits | A portable review attached to an exact revision |
-| What gets built? | An exact commit's tree | An exact integration snapshot |
-| What if work conflicts? | Unmerged index state and operation-specific continuation | A saved conflict with named inputs; resolve when ready |
-| What must I download? | Full, shallow, or partial clone, plus checkout choices | An explicit working set and requested history, with completeness reported |
-| How does one large project scale? | Optimized Git plus hosting infrastructure | Independently partitioned content, change records, and indexes |
-| Who decides what `main` means? | The chosen remote's branch authority | A project-designated, replicated channel authority |
+```sh
+kelp init
+kelp remote set https://code.example.com/shop   # Optional; configure once.
+# Edit files.
+kelp commit -m "Add checkout"
+# Edit and commit more when ready.
+kelp push
+```
 
-These are comparisons of native abstractions, not claims that Git tooling cannot provide similar features. Jujutsu, Sapling/Mononoke, Pijul, and Radicle already demonstrate important parts of this direction. [Research and sources](01-research.md).
+`commit` saves deliberately. `push` transfers committed transactions and leaves unfinished files alone. Local-only work requires no account or server. `clone`, `pull`, `diff`, `log`, `show`, and in-place `restore` provide the ordinary interface.
 
-## The distribution answer
+The interface does not make users create transaction IDs, start background services, or register each new file. Ignore rules control inclusion. Commits and complete saved views have stable hashes, displayed as unambiguous prefixes. Restore takes a complete saved-view hash, not a locally numbered history position.
 
-Git is distributed, and Git hosting **can** scale horizontally. Replicas can serve reads, different repositories can live on different nodes, and current Git supports partial clones and cache-friendly bundle delivery.
+## What the implementation must prove
 
-Kelp's harder target is **intra-project scaling**: adding machines should increase capacity for a single large project without requiring users to divide it into independently managed repositories.
-
-Three things scale differently:
-
-1. **Content:** split by content hash; replicate and cache near readers.
-2. **Independent work:** partition change records by change ID; publish unrelated changes concurrently.
-3. **Accepted history:** order updates per channel, such as `main`. Prepare and test in parallel, but atomically decide which snapshot becomes current.
-
-There is no promise of unlimited parallel writes to one authoritative `main`. Agreeing on one answer requires coordination. The design keeps that coordinated step small and avoids making it copy files, calculate large diffs, or run tests. [Distribution design](04-distribution.md).
-
-## Read by interest
-
-| Document | What it answers |
+| Goal | Observable proof |
 | --- | --- |
-| [1. Research](01-research.md) | How Git works, what people struggle with, and what existing successors teach us |
-| [2. Product and workflows](02-product-and-workflows.md) | Who this is for, requirements, and concrete CLI examples |
-| [3. Data model](03-data-model.md) | Exact meanings of changes, revisions, snapshots, conflicts, and history |
-| [4. Distribution](04-distribution.md) | Partitioning, replication, atomicity, offline work, failures, and federation |
-| [5. Protocol](05-protocol.md) | Client/server contracts, synchronization, transfers, and error behavior |
-| [6. Delivery and validation](06-delivery-and-validation.md) | Migration, scope, milestones, benchmarks, and unresolved decisions |
-| [Sources](sources.md) | Annotated evidence and limits of the research |
+| Independent work stays independent | Two clients push disjoint commits without pulling, rewriting, or contending on a project head |
+| Conflicts preserve work | Both concurrent values remain available; a resolution names both parents |
+| Multi-file edits are atomic | One journal record introduces all file edits; incomplete uploads introduce none |
+| One project spans machines | Its content and transaction journals live on several HTTP storage nodes |
+| More than one write frontend | Two stateless gateways accept work for the same project |
+| Capacity can grow | A fourth node accepts new writes while earlier objects remain readable |
+| Exact builds remain possible | A view ID fixes a transaction-root set and its dependency closure |
 
-Start with this overview and the workflow examples. Storage reviewers should then read documents 3–5 together.
+These are the acceptance tests for the architectural proof. CLI naming changes alone do not satisfy them.
 
-## Decisions proposed for approval
+## Distribution
 
-- Keep local operation, immutable snapshots, content verification, and portable history.
-- Make change identity independent of revision bytes and integration position.
-- Use explicit, ordinary file-level edits with recorded move information. Language-aware merging is optional future work.
-- Make partial replication normal and full mirroring available; state exactly what works offline.
-- Separate dissemination of proposals from authority to update shared channels.
-- Retain atomic project-wide snapshots even when their data spans machines.
-- Ship a useful single-machine implementation before the clustered service.
+Content and transaction records are hash-partitioned within a project. Each storage node has its own durable journal. Gateways validate transactions and route them to their owners; they hold no authoritative project-head database.
 
-## Costs we accept
+Pull unions journal entries, retrieves required ancestors, and materializes the resulting view. Journal positions are transport cursors local to a node, not a global order imposed on all work.
 
-Kelp has more kinds of records than Git's compact core. Sparse clients depend on reachable providers for uncached data. A clustered installation needs real distributed-database operations. Git compatibility cannot preserve every new concept.
+The first distributed implementation has durable single-copy storage partitions, incremental journals, and read fallback during node additions. Replication, automated node evacuation, advanced indexes, and production throughput qualification remain separate work. Full-project discovery requires the configured nodes to be available.
 
-The proposal is justified only if those costs buy measurably easier collaboration and better single-project scaling. The [validation plan](06-delivery-and-validation.md) includes comparison with well-configured Git and Jujutsu, and explicit reasons to stop or narrow the project.
+## Documents
+
+| Document | Purpose |
+| --- | --- |
+| [1. Research](01-research.md) | Git, user friction, and prior art |
+| [2. Product and workflows](02-product-and-workflows.md) | Commands and user-visible guarantees |
+| [3. Transaction model](03-data-model.md) | Dependencies, atomicity, conflicts, and exact views |
+| [4. Distribution](04-distribution.md) | Placement, independent journals, node growth, and failures |
+| [5. Protocol](05-protocol.md) | Network contracts and compatibility |
+| [6. Delivery and validation](06-delivery-and-validation.md) | Evidence, implementation limits, and remaining milestones |
+| [Sources](sources.md) | Annotated research references |

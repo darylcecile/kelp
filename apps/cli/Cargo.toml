@@ -1,6 +1,6 @@
 [package]
 name = "kelp-cli"
-description = "Local-first, change-oriented version control"
+description = "Save, share, and restore your project"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,16 +16,13 @@ clap.workspace = true
 fs2.workspace = true
 ignore.workspace = true
 kelp-core.workspace = true
-notify.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+similar.workspace = true
 tempfile.workspace = true
 uuid.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
 
 [dev-dependencies]
 axum.workspace = true

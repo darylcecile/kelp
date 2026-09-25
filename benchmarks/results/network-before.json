@@ -1,0 +1,38 @@
+{
+  "fixture": {
+    "files": 200,
+    "bytes_per_file": 4096,
+    "latency_ms_per_request": 5
+  },
+  "scope": "One localhost gateway/store. Request bodies exclude HTTP/TLS headers. This measures batching, not scale-out or Git parity.",
+  "initial_push": {
+    "elapsed_ms": 3451.31,
+    "requests": 403,
+    "request_body_bytes": 848695,
+    "response_body_bytes": 155
+  },
+  "clone": {
+    "elapsed_ms": 3117.586,
+    "requests": 203,
+    "request_body_bytes": 14,
+    "response_body_bytes": 848880
+  },
+  "incremental_push": {
+    "elapsed_ms": 54.571,
+    "requests": 6,
+    "request_body_bytes": 325,
+    "response_body_bytes": 155
+  },
+  "incremental_pull": {
+    "elapsed_ms": 261.297,
+    "requests": 4,
+    "request_body_bytes": 15,
+    "response_body_bytes": 510
+  },
+  "unchanged_pull": {
+    "elapsed_ms": 46.171,
+    "requests": 2,
+    "request_body_bytes": 15,
+    "response_body_bytes": 119
+  }
+}

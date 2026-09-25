@@ -5,7 +5,7 @@
 ## Findings
 
 1. Git's immutable, content-addressed storage is a strength worth retaining.
-2. A commit is an exact historical record, but a poor standalone identity for work that is being revised and reviewed.
+2. Snapshot identity is useful, but unrelated edits need not depend on a shared project-wide history position. File-scoped change dependencies are a candidate alternative.
 3. Many everyday complaints concern confusing state and terminology. They do not establish that the storage model must be replaced.
 4. Large-project scaling requires separating storage, computation, and coordinated publication. Production systems already demonstrate this separation.
 5. Peer-to-peer distribution and horizontal server scaling are different problems. A successor should address both explicitly.
@@ -76,11 +76,11 @@ The table distinguishes evidence of frustration from a proposed explanation. The
 
 | User's question | Evidence | Diagnosis | Kelp response |
 | --- | --- | --- | --- |
-| “Which version did I just save?” | Gitless research examines conceptual mismatches; staging has multiple roles | Working copy, index, and history require separate mental bookkeeping | Automatic local checkpoints; publish records an exact revision; isolated test workspace |
-| “Why is my branch up to date if push fails?” | Evans documents stale remote-tracking information and confusing push/pull advice | Last-observed remote state looks like current remote truth | Always show when a channel was last checked |
+| “Which version did I just save?” | Gitless research examines conceptual mismatches; staging has multiple roles | Working copy, index, and history require separate mental bookkeeping | Explicit versions; log descriptions and changed files; show exact diffs |
+| “Why is my branch up to date if push fails?” | Evans documents stale remote-tracking information and confusing push/pull advice | Last-observed remote state looks like current remote truth | Distinguish the last shared version from the remote's current head |
 | “Which side is mine in this conflict?” | Evans documents shifting `ours`/`theirs` meanings across operations | Operation-dependent labels hide actual inputs | Label conflict sides by author, revision, and target snapshot |
-| “How do I get my work back?” | Reflog documentation; self-reported losses in Evans's polls | Recovery exists, but is not one discoverable workflow and cannot recover every unsaved file | Automatic on-disk checkpoints and operation history with explicit retention and recovery commands |
-| “Why did a small edit disrupt my review stack?” | Jujutsu's design addresses revision identity and descendant rewrites | Commit identity also encodes ancestry; review identity is external | Stable change identity and pinned dependency revisions |
+| “How do I get my work back?” | Reflog documentation; self-reported losses in Evans's polls | Recovery exists, but is not one discoverable workflow and cannot recover every unsaved file | In-place restore with a labelled, inspectable backup |
+| “Why did a small edit disrupt my review stack?” | Jujutsu's design addresses revision identity and descendant rewrites | Commit identity also encodes ancestry; review identity is external | Stable review identity in an optional collaboration layer |
 | “Why does checkout require so much data?” | Git partial-clone design; Sapling scale documentation | Working set, historical data, and transfer planning are separate concerns | Select paths and history explicitly; batch object retrieval |
 | “Why do large assets need another system?” | Git LFS stores pointers separately from large-file contents | Large-file distribution is an extension with another storage lifecycle | One content model for source and assets, with chunked large files |
 | “Why is our giant repository a special infrastructure project?” | GitHub maintenance report; Gitaly limitations; Mononoke architecture | Repository-wide computation and placement can concentrate work | Partition data within one project; keep expensive work outside publication |
@@ -133,7 +133,7 @@ Sources: [A1–A6](sources.md#a1), [D2–D3](sources.md#d2), [U3](sources.md#u3)
 
 A **CRDT** is a data structure whose replicas can combine concurrent updates according to defined rules. Convergence means replicas agree; it does not mean the resulting program is correct. Pijul explicitly distinguishes a conflict-free replicated representation from the source conflicts that representation contains. [A5](sources.md#a5)
 
-Kelp uses immutable proposal exchange and explicit divergent revisions. It does not silently combine every edit into accepted code. A character-level editing system would also need decisions about deletion history, storage growth, binary files, and release boundaries.
+Kelp's implemented transaction model is a replicated set of immutable, file-scoped edits. Set union is order-independent; competing file values remain explicit conflicts. It does not silently turn convergence into a claim of correct code. Character-level editing would additionally need decisions about deletion history, storage growth, and binary files.
 
 ### Syntax-tree or AI-native history
 
@@ -143,12 +143,12 @@ Kelp stores ordinary bytes and explicit file operations. Language tools may sugg
 
 ### Just put Git objects in object storage
 
-This can help hosting, and existing systems do related work. It does not alone give stable change identity, portable review state, predictable partial-workspace behavior, or a defined cross-shard publication transaction.
+This can help hosting, and existing systems do related work. It does not alone provide a simpler local workflow, predictable partial-workspace behavior, or a defined cross-shard publication transaction.
 
 ### Completely remove snapshots
 
-Builds, releases, debugging, and incident response need an unambiguous answer to “Which bytes were used?” Replaying all edits from the beginning is not a good default read path. Kelp therefore keeps snapshots as durable results, while making changes the collaboration primitive.
+Builds, releases, debugging, and incident response need an unambiguous answer to “Which bytes were used?” Kelp derives exact snapshots from selected transaction sets and keeps local materialized views for recovery. Efficient persistent view indexes are still needed before large-history performance can be claimed.
 
 ## Research-derived design boundary
 
-Kelp should be a **change-oriented collaboration model over a partitionable snapshot store**. The novel claim is the combined, open contract—not any single ingredient. The next documents specify that contract and the experiments needed to justify it.
+Kelp uses **atomic file-scoped transactions over partitioned content and journals**. Independent transactions compose without creating another project-wide merge commit. The next documents specify that contract, the multi-node proof, and the remaining limits. Familiar commands are an interface constraint; they are not the architectural differentiator.

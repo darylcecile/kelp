@@ -1,9 +1,10 @@
-//! The experimental object format shared by the CLI and remote.
-//!
-//! Version zero uses typed SHA-256 objects and deterministic JSON for metadata.
-//! It is deliberately distinct from the unimplemented v1 format in the PRD.
+//! Shared immutable content and the transaction model used by the CLI/remotes.
+//! The object hash envelope stays stable across network protocol versions.
 
+mod delta;
 pub mod storage;
+pub mod transactions;
+pub mod transfer;
 
 use std::collections::BTreeMap;
 
@@ -12,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const PROTOCOL: &str = "kelp/0";
+pub const OBJECT_FORMAT: &str = "kelp/0";
 pub const MAX_BLOB_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_METADATA_BYTES: usize = 2 * 1024 * 1024;
 
@@ -121,7 +123,7 @@ pub struct ApiError {
 /// Object type and length are hashed along with bytes to prevent type confusion.
 pub fn object_id(kind: &str, bytes: &[u8]) -> String {
     let mut hash = Sha256::new();
-    hash.update(format!("{PROTOCOL}\0{kind}\0{}\0", bytes.len()));
+    hash.update(format!("{OBJECT_FORMAT}\0{kind}\0{}\0", bytes.len()));
     hash.update(bytes);
     format!("{:x}", hash.finalize())
 }

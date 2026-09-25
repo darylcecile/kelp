@@ -11,7 +11,9 @@ anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
 kelp-core.workspace = true
+reqwest.workspace = true
 rusqlite.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -19,7 +21,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-reqwest.workspace = true
 tempfile.workspace = true
 uuid.workspace = true
 

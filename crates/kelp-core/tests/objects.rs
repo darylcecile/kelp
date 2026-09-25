@@ -24,8 +24,8 @@ fn snapshots_are_reproducible_and_corrupt_content_is_rejected() -> anyhow::Resul
     storage::verify_snapshot(&db, "demo", &first)?;
     assert!(storage::get(&db, "another-project", "blob", &blob).is_err());
     db.execute(
-        "UPDATE objects SET bytes = ?1 WHERE id = ?2",
-        rusqlite::params![b"corrupt".as_slice(), blob],
+        "UPDATE loose_objects SET bytes = ?1 WHERE id = (SELECT loose FROM object_index WHERE hash=?2)",
+        rusqlite::params![b"corrupt".as_slice(), storage::hash_bytes(&blob)?],
     )?;
     assert!(storage::verify_snapshot(&db, "demo", &first).is_err());
     Ok(())

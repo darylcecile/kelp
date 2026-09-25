@@ -1,86 +1,117 @@
 # Kelp
 
-Local-first, change-oriented version control. Edit files, then publish; further publications update the same change.
+Version control built around independent edits. Teammates working on different files can push without taking turns or rewriting each other's commits. A remote can distribute one project's files and history across storage nodes.
 
-Kelp automatically keeps local checkpoints so you can recover earlier work. Use it entirely on your own machine, or connect a remote to share changes with others. This is an early release; see [current limits](#current-limits) below.
+**Version 0.0.2:** an experimental, transaction-based release. For another version, use the README at its release tag.
 
 ## Install
 
-1. Download the archive for your system from [GitHub Releases](https://github.com/darylcecile/kelp/releases): Linux x86-64, macOS Intel/Apple Silicon, or Windows x86-64.
-2. Extract `kelp` (or `kelp.exe` on Windows).
-3. Move it into a directory on your `PATH`.
-4. Run `kelp --version` to check the installation.
+Download your platform's archive from [GitHub Releases](https://github.com/darylcecile/kelp/releases), extract `kelp` (`kelp.exe` on Windows), and place it on your `PATH`. Run `kelp --version` to check it. Releases include SHA-256 checksums.
 
-Each release includes `SHA256SUMS` for verifying downloads.
+Upgrading from 0.0.1? Use a matching 0.0.2 remote. Existing local saved snapshots remain recoverable; explicitly commit the desired files to enter the new transaction protocol. Opening an older database upgrades its storage format, so keep a backup if you need to return to an older binary.
 
-## Start entirely locally
+## Save locally
 
 ```sh
-mkdir my-project
+kelp init my-project
 cd my-project
-kelp init
-
-# Create files in your editor, then include them in version control:
-kelp track src
-kelp status
-kelp log
-
-# Optional named checkpoint:
-kelp checkpoint -m "Before refactoring"
-
-# Recover a checkpoint into a new directory:
-kelp restore 1 --to ../recovered-project
+# Create and edit files.
+kelp diff
+kelp commit -m "Add checkout"
 ```
 
-`init` needs no network, token, or remote. It tracks existing regular files, respecting `.gitignore` and `.kelpignore`. Add later files with `kelp track PATH`. Tracked deletions remain part of subsequent snapshots.
+No account or remote is required. New files are included automatically unless ignored by `.gitignore` or `.kelpignore`. Files already included remain known so edits and deletions can be saved.
 
-Automatic checkpoints start with `init` and `open`. They capture tracked bytes saved by your editor, not unsaved editor buffers. `kelp status` reports the watcher, and `.kelp/watch.log` contains capture errors. Use `kelp watch --stop` to stop the process, `kelp watch` to restart it, or `--no-watch` on `init`/`open` in automation. All checkpoints are retained in v0.
+Commits are deliberate. Editing files or inspecting history does not create background versions.
 
-## Share a change
+## Configure a remote once
 
-Get a remote URL and access token from your remote's operator. In your project's shell:
+Get a project URL and token from your remote's operator:
 
 ```sh
 export KELP_TOKEN="<your access token>"
-kelp remote set https://code.example.com
-kelp publish -m "Fix checkout timeout"
-
-# Edit tracked files after feedback, then:
-kelp publish
-kelp changes
+kelp remote set https://code.example.com/my-project
+kelp push
 ```
 
-The first publish creates the project on the remote and the change identity. Later publications keep that identity. Unchanged work reports “already published.” Failed publications retain their exact revision and request ID locally for retry. The access token is read from the environment and is not written into workspace metadata.
+In PowerShell, use `$env:KELP_TOKEN = "<your access token>"`.
 
-In PowerShell, set the token with `$env:KELP_TOKEN = "<your access token>"` instead of `export`.
+**Push sends committed work only.** You can make several local commits and push when satisfied; unfinished edits stay on your machine. Interrupted transfers can be retried without changing commit IDs.
 
-## Open shared work
-
-Open a published change into a new directory using the change ID printed by publish:
+## Collaborate
 
 ```sh
-kelp open https://code.example.com ../review-copy \
-  --project my-project --change <change-id>
+kelp clone https://code.example.com/my-project
+cd my-project
+# Edit files.
+kelp commit -m "Handle empty input"
+kelp push
+kelp pull
 ```
 
-An open change is editable and can be republished from either workspace. Concurrent revisions are both retained. When a change has multiple heads, `open` requires an explicit `--revision <object-id>`.
+Different-file commits combine without a pull-before-push requirement. If people commit different edits to the same file, both versions are retained and pull reports the conflict.
 
-`kelp change new "Next task"` starts separate work based on the current files. `kelp remote remove` returns the workspace to local-only operation without deleting checkpoints. `--json` provides machine-readable command output, and `-C PATH` selects another working directory.
+```sh
+kelp pull --keep-local       # Or --keep-remote.
+# Inspect/edit the result and run your tests.
+kelp commit -m "Resolve the competing edits"
+kelp push
+```
+
+The resolution records both alternatives as parents; it does not erase either original commit. The current preview requires an existing contributor to resolve conflicts before a clean clone can be made.
+
+## Inspect your work
+
+```sh
+kelp status           # Uncommitted files and commits ready to push
+kelp diff             # Current file edits
+kelp log              # Local saved views and recovery points
+kelp show <view-hash> # Exact edits in a saved view
+kelp log --commits    # Included edit transactions and their messages
+kelp show <commit-id> # Inspect a shared commit; unique prefixes work
+```
+
+Both commits and saved views use hashes, displayed as short, unambiguous prefixes. A commit identifies a batch of edits; a saved view identifies the complete project state you can restore. `log` shows view hashes; `log --commits` shows commit hashes. Full hashes also work, and ambiguous prefixes produce an error.
+
+## Restore in place
+
+```sh
+kelp restore <view-hash>
+```
+
+This restores the current folder and first saves a labelled backup of your work. The output gives the backup's view hash. Ignored files and Kelp metadata remain. A commit hash alone is not a restore target because it may describe only an independent edit to one file.
+
+Restore changes working files. To share the restored result, commit it and push:
+
+```sh
+kelp commit -m "Restore the working checkout"
+kelp push
+```
+
+## Reclaim storage
+
+```sh
+kelp gc
+```
+
+This losslessly packs stored objects and reclaims unused database pages. It keeps every commit, conflicting alternative, saved view, and recovery backup. Existing hashes continue to work. It does not commit unfinished files or push anything.
+
+On the documented 1,000-file/101-commit benchmark, maintained Kelp storage is about 324 KB versus Git's 330 KB. Results depend on the project; [the benchmark report](benchmarks/README.md#lossless-compaction-measurements) includes the read-time tradeoff.
 
 ## Current limits
 
-- Regular files up to 16 MiB, with UTF-8 paths. Symlinks are not supported yet.
-- Each checkpoint's file listing is limited to 2 MiB. Large-project optimizations are still in development.
-- `open` retrieves the selected change's base and result, not a full project mirror.
-- Merging, landing into shared channels, review approvals, Git import, and selecting individual hunks are not available yet.
+- Regular, portable UTF-8-path files up to 16 MiB; no symlinks or large-file chunking yet.
+- Conflicts are handled at file level, not automatically merged within a file.
+- Replication, automated storage-node evacuation, Git import, and release-view pinning are future work.
+- The distributed preview stores one copy of each object. Backups remain necessary for permanent node loss.
 
-On Unix, executable bits are retained. Windows uses ordinary file permissions while preserving imported executable metadata.
+Kelp caches validated file state, compresses/batches object transfers, and can compact local storage into bounded packs. [Benchmark method and results](benchmarks/README.md) describe the measured space and latency, including comparisons where Git performs better.
 
-## More help
+## Help
 
-Run `kelp --help` or `kelp <command> --help` for command options.
+Use `kelp --help` or `kelp <command> --help`. `--json` provides structured output and `-C PATH` selects a project directory.
 
+- [Remote operation and protocol](apps/remote/README.md)
 - [Report a problem](https://github.com/darylcecile/kelp/issues)
-- [Host a remote](apps/remote/README.md)
 - [Development and source builds](CONTRIBUTING.md)
-- [Product roadmap](PRD/README.md)
+- [Architecture and product specification](PRD/README.md)
