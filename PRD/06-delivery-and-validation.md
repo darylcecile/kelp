@@ -80,13 +80,13 @@ Do not compare a single-copy Kelp shard with a replicated Git host and call the 
 - Validate parent path references, hashes, lengths, and graph closure on both write/read paths.
 - Preserve current files and recovery snapshots when a filesystem update cannot complete.
 
-Replication and node-loss recovery need additional fault models. Current single-copy durability is not protection against permanent storage-node loss.
+Replica tests cover continued clone/pull/push after losing one of three nodes with R=2, rejection when the read fault budget is exceeded, and repair/evacuation preserving historical contents and release pins. These are process/node-loss proofs; correlated regional/storage failures require deployment-specific qualification.
 
 Storage compaction qualification additionally checks every preserved object hash, conflicting file alternatives, in-place recovery backups, replay after restart, writes after compaction, older database migration, and reads through packed distributed storage. Corrupt input must abort the location transaction without removing other objects. Large objects stay independently readable rather than exceeding the decoded pack budget.
 
 The compaction implementation passes the 30-test workspace suite plus the added incompressible-group budget test. Its maintained footprint on the 1,000-file/101-commit fixture is 323,584 bytes, compared with Git's 330,148 bytes. Kelp retains all logical objects and recovery events; GC only changes physical representation. Post-maintenance status is 20.6 ms median versus 18.0 ms before maintenance; historical show is 12.8 ms. The [raw measurement](../benchmarks/results/compacted.json) and [method](../benchmarks/README.md) record the tradeoffs and limit the size claim to this fixture.
 
-Partial-checkout qualification covers selected-only blob transfer, full cross-directory transaction metadata, selected additions/deletions, outside-file preservation during push/pull/restore, remembered multiple-path selections, excluded versus relevant conflicts, scope-bound saved-view hashes, and explicit failure when an export requires uncached dependency blobs. Full metadata retrieval remains a known scaling cost; file-payload savings are not a claim of metadata-sparse cloning.
+Partial-checkout qualification covers selected-only blobs, omission of unrelated metadata, full cross-directory dependency closure, expansion with drafts, and scoped recovery after expansion. Additional coverage exercises text merge, large-file chunk reuse and round trips, symlinks, native names, Git merge-history import and provenance, and immutable release tags.
 
 ## Compatibility and adoption
 
@@ -98,10 +98,8 @@ Git LFS payloads must be fetched before claiming a complete import. Submodules i
 
 ## Remaining product decisions
 
-- How users select/pin historical shared views and releases.
 - Richer conflict browsing for new contributors cloning a conflicted project.
 - Efficient indexed frontiers and paged edit sets for very large commits/history.
-- Replication, live node evacuation, and explicit storage durability profiles.
 - Author identity, signatures, access boundaries, and untrusted peer exchange.
 - Review and CI policy on chosen views without imposing one mandatory draft-write head.
 

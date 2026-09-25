@@ -25,7 +25,8 @@ All public project routes require the client bearer token. `/healthz` is public.
   "project": "shop",
   "protocol": "kelp/1",
   "layout": "<layout-fingerprint>",
-  "storage_nodes": 3
+  "storage_nodes": 3,
+  "replicas": 2
 }
 ```
 
@@ -48,7 +49,7 @@ Push inventories the outbox and descends into ancestors only when they are absen
 
 ## Object batches
 
-Info/download requests contain `objects: [{"kind": "blob", "id": "..."}]`; kinds are `blob` or `transaction`. Duplicate keys or batches above 128 objects are rejected. Info returns logical byte lengths or null for missing objects.
+Info/download requests contain `objects: [{"kind": "blob", "id": "..."}]`; kinds are `blob` or `transaction`. Duplicate keys or batches above 128 objects are rejected. Info returns logical byte lengths or null, plus available `copies`. A publication is treated as durable only when the required replicas are present.
 
 Packs are Zstandard-compressed binary bodies. The decoded stream starts with `KLP1`, followed by records containing a one-byte kind, 64 ASCII hash characters, a four-byte big-endian length, and exact object bytes. The total decoded limit is 32 MiB, including framing; individual blob/transaction limits still apply. Decoders enforce counts, lengths, kinds, uniqueness, and hashes before installing objects.
 
@@ -58,7 +59,7 @@ File uploads can be batched and hash-routed by a gateway to storage owners. Tran
 
 The request body is the transaction described in [the model](03-data-model.md). Parent lists refer only to prior versions of the paths being written.
 
-The gateway checks structure, format, parent membership, and file-object availability. The owner then performs:
+The gateway checks structure, format, parent membership, and replicated content closure, including chunk manifests and optional provenance. Each replica performs:
 
 ```text
 begin local storage transaction
@@ -88,7 +89,7 @@ An empty cursor list starts discovery. Each storage journal returns at most 256 
 
 Transaction bodies may reference parents not listed in this particular page or observed journal prefix. The client fetches those parents recursively before validating/materializing the view. Duplicate and out-of-order delivery are harmless; incomplete closure is an error.
 
-With `clone --paths`, the client still obtains the complete transaction metadata closure, but requests file blobs only for selected paths. Selection is applied when building object batches, not by dropping edits from transaction bodies. Excluded blobs are intentionally absent locally; they are not deletions or corruption. Selected blobs are still hash/length checked. This is compatible with the existing v1 remote API and requires no new server-side filtering endpoint.
+The optional `paths` field selects indexed journal entries touching those prefixes or structural ancestors. The client then obtains their complete transaction dependency closure, requests selected file blobs and provenance, and verifies hashes/lengths. Transactions are never split into per-path fragments. Expanding a selection resets cursors. Older servers can ignore the additive field and return full metadata correctly.
 
 Cursors are saved after a successful local synchronization. A conflict that stops pull does not advance them past unincorporated work.
 
@@ -98,13 +99,17 @@ Push can accept concurrent conflicting transactions because both are valid indep
 
 `pull --keep-local` or `--keep-remote` selects draft file contents in an existing workspace. `commit` records the actual resolution, with every competing file parent in its edit. Until that transaction is included, the shared view remains conflicted.
 
-The prototype refuses a clean clone when conflicts affect its selected paths, including structural collisions across the selection boundary. Conflicts entirely outside a partial selection remain in the retained metadata without blocking that checkout. An existing contributor can resolve affected conflicts and push the resolution. Selecting an arbitrary historical view during clone and richer conflict browsing are later UI work.
+The client can materialize a clean three-way text merge during clone or pull, retaining original heads until an explicit resolution commit. Overlapping selected conflicts and structural collisions still require a contributor's resolution. Unrelated outside conflicts are neither fetched nor silently resolved by a partial checkout.
 
 ## Private storage API
 
 Storage nodes use `/storage/projects/{project}` routes for project registration, immutable objects, journal pages, and validated-transaction appends. Only gateways/operators receive the storage token.
 
-Gateways hash-route writes. Reads try the current owner, then other members when an object remains on an earlier owner after node growth. A journal failure produces an unavailable response, not a partial-success page.
+Gateways hash-route replicated writes. Reads try the current owner, then other members. Sync tolerates fewer than R failed members, preserving their cursors; exceeding that budget returns unavailable. `/storage/drain` fences new writes during evacuation, and `/storage/inventory` pages immutable content for verified copying.
+
+## Release pins
+
+`POST /pins` validates a pin's complete snapshot against the dependency closure of its causal roots, then replicates it. `GET /pins?after=HASH` returns up to 128 pins in hash order. Pins are immutable typed objects; concurrent reuse of a name retains both IDs. Clients resolve unambiguous names to saved-view hashes. Pins cannot expose uncommitted working files.
 
 ## Errors
 
@@ -121,4 +126,4 @@ Gateways hash-route writes. Reads try the current owner, then other members when
 
 Transport is HTTPS in deployment, HTTP behind the local test/deployment proxy. Metadata is deterministic compact JSON; individual file endpoints use raw bytes and batch endpoints use compressed packs. The typed object-hash envelope remains versioned separately from the network API.
 
-Standalone servers retain v0 endpoints for existing clients/data. v1 clients do not silently downgrade to snapshot-head synchronization. Replication acknowledgments, signing, sparse proofs, and automatic node evacuation require future protocol work.
+Standalone servers retain v0 endpoints for existing clients/data. v1 clients do not silently downgrade to snapshot-head synchronization. Existing transaction/file encodings remain valid; extended entries and provenance require transaction format 2. Signing and untrusted sparse proofs are separate from the authenticated storage protocol.

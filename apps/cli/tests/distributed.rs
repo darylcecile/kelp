@@ -47,6 +47,155 @@ fn cli(path: &Path, args: &[&str]) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replicas_survive_node_loss_and_retry_committed_work() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut servers = Servers(Vec::new());
+    let mut nodes = Vec::new();
+    for index in 0..3 {
+        nodes.push(
+            start(
+                kelp_remote::storage_app(
+                    &root.path().join(format!("node{index}")),
+                    "storage-token".into(),
+                )?,
+                &mut servers,
+            )
+            .await?,
+        );
+    }
+    let gateway = start(
+        kelp_remote::replicated_app(nodes, "client-token".into(), "storage-token".into(), 2)?,
+        &mut servers,
+    )
+    .await?;
+    let url = format!("{gateway}/demo");
+    cli(root.path(), &["init", "alice", "--remote", &url]);
+    let alice = root.path().join("alice");
+    fs::write(alice.join("file"), "initial")?;
+    let saved = cli(&alice, &["commit", "-m", "Initial"]);
+    cli(&alice, &["tag", "v1.0"]);
+    cli(&alice, &["push"]);
+    servers.0[0].abort();
+    tokio::task::yield_now().await;
+    cli(root.path(), &["clone", &url, "bob"]);
+    assert_eq!(fs::read(root.path().join("bob/file"))?, b"initial");
+    assert_eq!(
+        cli(&root.path().join("bob"), &["tag"])[0]["view"],
+        saved["view"]
+    );
+    fs::write(alice.join("file"), "after one node disappeared")?;
+    cli(&alice, &["commit", "-m", "While degraded"]);
+    cli(&alice, &["push"]);
+    cli(&root.path().join("bob"), &["pull"]);
+    assert_eq!(
+        fs::read(root.path().join("bob/file"))?,
+        b"after one node disappeared"
+    );
+    cli(&root.path().join("bob"), &["restore", "v1.0"]);
+    assert_eq!(fs::read(root.path().join("bob/file"))?, b"initial");
+    servers.0[1].abort();
+    tokio::task::yield_now().await;
+    let response = reqwest::Client::new()
+        .post(format!("{gateway}/v1/projects/demo/sync"))
+        .bearer_auth("client-token")
+        .json(&SyncRequest::default())
+        .send()
+        .await?;
+    assert!(
+        !response.status().is_success(),
+        "losing too many replicas must not look like an empty view"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn evacuation_drains_and_preserves_history_blobs_and_release_pins() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut servers = Servers(Vec::new());
+    let mut nodes = Vec::new();
+    for index in 0..4 {
+        nodes.push(
+            start(
+                kelp_remote::storage_app(
+                    &root.path().join(format!("node{index}")),
+                    "storage-token".into(),
+                )?,
+                &mut servers,
+            )
+            .await?,
+        );
+    }
+    let gateway = start(
+        kelp_remote::replicated_app(
+            nodes.clone(),
+            "client-token".into(),
+            "storage-token".into(),
+            2,
+        )?,
+        &mut servers,
+    )
+    .await?;
+    let url = format!("{gateway}/demo");
+    cli(root.path(), &["init", "alice", "--remote", &url]);
+    let alice = root.path().join("alice");
+    for i in 0..8 {
+        fs::write(alice.join(format!("file{i}")), format!("version {i}"))?;
+        cli(&alice, &["commit", "-m", "Add a file"]);
+    }
+    cli(&alice, &["tag", "v1.0"]);
+    cli(&alice, &["push"]);
+    let report = kelp_remote::maintenance::maintain(
+        nodes.clone(),
+        "storage-token".into(),
+        2,
+        Some(nodes[0].clone()),
+    )
+    .await?;
+    assert!(report.objects > 0);
+    assert_eq!(report.nodes.len(), 3);
+    let bytes = b"must not enter drained node";
+    let response = reqwest::Client::new()
+        .put(format!(
+            "{}/storage/projects/demo/objects/blob/{}",
+            nodes[0],
+            object_id("blob", bytes)
+        ))
+        .bearer_auth("storage-token")
+        .body(bytes.as_slice())
+        .send()
+        .await?;
+    assert!(!response.status().is_success());
+    servers.0[0].abort();
+    let new_gateway = start(
+        kelp_remote::replicated_app(
+            report.nodes.clone(),
+            "client-token".into(),
+            "storage-token".into(),
+            2,
+        )?,
+        &mut servers,
+    )
+    .await?;
+    cli(
+        root.path(),
+        &["clone", &format!("{new_gateway}/demo"), "after"],
+    );
+    let after = root.path().join("after");
+    assert_eq!(cli(&after, &["tag"])[0]["name"], "v1.0");
+    for i in 0..8 {
+        assert_eq!(
+            fs::read(after.join(format!("file{i}")))?,
+            format!("version {i}").as_bytes()
+        );
+    }
+    kelp_remote::maintenance::maintain(report.nodes, "storage-token".into(), 2, None).await?;
+    fs::write(after.join("new"), "after evacuation")?;
+    cli(&after, &["commit", "-m", "New topology"]);
+    cli(&after, &["push"]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_project_spans_three_stores_and_two_stateless_gateways() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let mut servers = Servers(Vec::new());
@@ -128,6 +277,7 @@ async fn one_project_spans_three_stores_and_two_stateless_gateways() -> anyhow::
                 .await?
                 .error_for_status()?;
             let transaction = Transaction {
+                provenance: None,
                 format: 1,
                 nonce: format!("batch-{index}"),
                 message: format!("Independent batch {index}"),
@@ -140,6 +290,7 @@ async fn one_project_spans_three_stores_and_two_stateless_gateways() -> anyhow::
                                 blob: blob.clone(),
                                 size: bytes.len() as u64,
                                 executable: false,
+                                kind: Default::default(),
                             }),
                         },
                     ),
@@ -151,6 +302,7 @@ async fn one_project_spans_three_stores_and_two_stateless_gateways() -> anyhow::
                                 blob,
                                 size: bytes.len() as u64,
                                 executable: false,
+                                kind: Default::default(),
                             }),
                         },
                     ),
@@ -182,6 +334,7 @@ async fn one_project_spans_three_stores_and_two_stateless_gateways() -> anyhow::
         .await?
         .error_for_status()?;
     let mut dependent = Transaction {
+        provenance: None,
         format: 1,
         nonce: "dependent".into(),
         message: "Update both halves across a shard dependency".into(),
@@ -196,6 +349,7 @@ async fn one_project_spans_three_stores_and_two_stateless_gateways() -> anyhow::
                             blob: blob.clone(),
                             size: 2,
                             executable: false,
+                            kind: Default::default(),
                         }),
                     },
                 )
@@ -302,6 +456,7 @@ async fn one_project_spans_three_stores_and_two_stateless_gateways() -> anyhow::
         .await?
         .error_for_status()?;
     let mut transaction = Transaction {
+        provenance: None,
         format: 1,
         nonce: "scale".into(),
         message: "Use added capacity".into(),
@@ -313,6 +468,7 @@ async fn one_project_spans_three_stores_and_two_stateless_gateways() -> anyhow::
                     blob,
                     size: bytes.len() as u64,
                     executable: false,
+                    kind: Default::default(),
                 }),
             },
         )]),
@@ -412,6 +568,7 @@ async fn incomplete_transactions_are_invisible_and_a_missing_shard_is_not_an_emp
         .error_for_status()?;
     let missing = object_id("blob", b"not uploaded");
     let transaction = Transaction {
+        provenance: None,
         format: 1,
         nonce: "incomplete".into(),
         message: "Atomic pair".into(),
@@ -424,6 +581,7 @@ async fn incomplete_transactions_are_invisible_and_a_missing_shard_is_not_an_emp
                         blob,
                         size: bytes.len() as u64,
                         executable: false,
+                        kind: Default::default(),
                     }),
                 },
             ),
@@ -435,6 +593,7 @@ async fn incomplete_transactions_are_invisible_and_a_missing_shard_is_not_an_emp
                         blob: missing,
                         size: 12,
                         executable: false,
+                        kind: Default::default(),
                     }),
                 },
             ),

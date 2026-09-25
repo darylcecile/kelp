@@ -41,10 +41,24 @@ enum Commands {
         path: Option<PathBuf>,
         /// Download only these project-relative files/directories (comma-separated or repeated).
         #[arg(long, value_delimiter = ',')]
-        paths: Vec<String>,
+        paths: Vec<PathBuf>,
     },
     /// Show uncommitted files and commits ready to push.
     Status,
+    /// Import a local Git repository and the selected revision's history.
+    Import {
+        source: PathBuf,
+        path: Option<PathBuf>,
+        #[arg(long = "ref", default_value = "HEAD")]
+        revision: String,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Pin a committed release view, or list pinned views.
+    Tag {
+        name: Option<String>,
+        view: Option<String>,
+    },
     /// Preview edits not yet committed.
     Diff,
     /// Save a described version locally, without sharing it.
@@ -56,6 +70,9 @@ enum Commands {
     Push { url: Option<String> },
     /// Get remote updates, preserving independent local edits.
     Pull {
+        /// Also download these paths; use --paths . for the whole project.
+        #[arg(long, value_delimiter = ',')]
+        paths: Vec<PathBuf>,
         /// Keep your files where both sides edited the same path.
         #[arg(long, conflicts_with = "keep_remote")]
         keep_local: bool,
@@ -122,7 +139,14 @@ fn location(workspace: &Workspace) -> Option<String> {
 fn display_diff(json: bool, files: Vec<FileDiff>) -> Result<()> {
     let text = files
         .iter()
-        .map(|file| format!("{} {}\n{}", file.file.kind, file.file.path, file.diff))
+        .map(|file| {
+            format!(
+                "{} {}\n{}",
+                file.file.kind,
+                kelp_core::paths::display(&file.file.path),
+                file.diff
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     emit(
@@ -136,12 +160,65 @@ fn display_diff(json: bool, files: Vec<FileDiff>) -> Result<()> {
     )
 }
 
+fn path_arguments(paths: Vec<PathBuf>) -> Result<Vec<String>> {
+    paths
+        .into_iter()
+        .map(|path| {
+            anyhow::ensure!(
+                !path.components().any(|part| matches!(
+                    part,
+                    std::path::Component::Prefix(_)
+                        | std::path::Component::RootDir
+                        | std::path::Component::ParentDir
+                )),
+                "--paths needs project-relative paths without .."
+            );
+            let clean: PathBuf = path
+                .components()
+                .filter(|part| !matches!(part, std::path::Component::CurDir))
+                .collect();
+            if clean.as_os_str().is_empty() && !path.as_os_str().is_empty() {
+                return Ok(".".into());
+            }
+            kelp_core::paths::from_native(&clean)
+        })
+        .collect()
+}
+
 fn run(cli: Cli) -> Result<()> {
     let directory = cli
         .directory
         .canonicalize()
         .context("working directory does not exist")?;
     match cli.command {
+        Commands::Import {
+            source,
+            path,
+            revision,
+            project,
+        } => {
+            let source = directory.join(source).canonicalize()?;
+            let name = project.unwrap_or_else(|| {
+                source
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .trim_end_matches(".git")
+                    .to_owned()
+            });
+            let destination =
+                directory.join(path.unwrap_or_else(|| PathBuf::from(format!("{name}-kelp"))));
+            let workspace = kelp_cli::import::repository(&source, &destination, &name, &revision)?;
+            emit(
+                cli.json,
+                &serde_json::json!({"project": name, "directory": workspace.root, "commits": workspace.state.transactions.len()}),
+                format!(
+                    "Imported {} commits into {}. Use kelp push to share them.",
+                    workspace.state.transactions.len(),
+                    workspace.root.display()
+                ),
+            )
+        }
         Commands::Init {
             path,
             project,
@@ -188,7 +265,8 @@ fn run(cli: Cli) -> Result<()> {
             let (base, project) = project_location(&url)?;
             let remote = Remote::new(&base, &project, token()?)?;
             let destination = directory.join(path.unwrap_or_else(|| PathBuf::from(&project)));
-            let workspace = remote.clone_paths(&base, &project, &destination, paths)?;
+            let workspace =
+                remote.clone_paths(&base, &project, &destination, path_arguments(paths)?)?;
             emit(
                 cli.json,
                 &serde_json::json!({"project": project, "directory": workspace.root, "remote": location(&workspace), "paths": workspace.state.paths}),
@@ -209,6 +287,40 @@ fn run(cli: Cli) -> Result<()> {
         command => {
             let mut workspace = Workspace::open(&directory)?;
             match command {
+                Commands::Tag { name, view } => {
+                    if let Some(name) = name {
+                        let pin = workspace.tag(name, view.as_deref())?;
+                        emit(
+                            cli.json,
+                            &serde_json::json!({"name": pin.name, "view": pin.view()?.id()?}),
+                            format!(
+                                "Pinned {} to view {}. Use kelp push to share it.",
+                                pin.name,
+                                pin.view()?.id()?
+                            ),
+                        )
+                    } else {
+                        let pins = workspace.pins()?;
+                        let entries = pins
+                            .iter()
+                            .map(|pin| {
+                                Ok(serde_json::json!({"name": pin.name, "view": pin.view()?.id()?}))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        let text = entries
+                            .iter()
+                            .map(|entry| {
+                                format!(
+                                    "{}  {}",
+                                    entry["name"].as_str().unwrap(),
+                                    entry["view"].as_str().unwrap()
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        emit(cli.json, &entries, text)
+                    }
+                }
                 Commands::Status => {
                     let mut status = workspace.status()?;
                     status.remote = location(&workspace);
@@ -235,7 +347,10 @@ fn run(cli: Cli) -> Result<()> {
                         ));
                     }
                     for path in &status.changed {
-                        text.push_str(&format!("  uncommitted  {path}\n"));
+                        text.push_str(&format!(
+                            "  uncommitted  {}\n",
+                            kelp_core::paths::display(path)
+                        ));
                     }
                     if status.changed.is_empty() {
                         text.push_str("No uncommitted edits.\n");
@@ -326,7 +441,11 @@ fn run(cli: Cli) -> Result<()> {
                                 entry.version.message.as_deref().unwrap_or("Saved version")
                             );
                             for file in entry.files.iter().take(5) {
-                                text.push_str(&format!("   {} {}\n", file.kind, file.path));
+                                text.push_str(&format!(
+                                    "   {} {}\n",
+                                    file.kind,
+                                    kelp_core::paths::display(&file.path)
+                                ));
                             }
                             if entry.files.len() > 5 {
                                 text.push_str(&format!(
@@ -398,6 +517,7 @@ fn run(cli: Cli) -> Result<()> {
                 Commands::Pull {
                     keep_local,
                     keep_remote,
+                    paths,
                 } => {
                     let resolution = if keep_local {
                         Resolution::Local
@@ -406,7 +526,11 @@ fn run(cli: Cli) -> Result<()> {
                     } else {
                         Resolution::Stop
                     };
-                    let updated = client(&workspace)?.pull(&mut workspace, resolution)?;
+                    let updated = client(&workspace)?.pull_paths(
+                        &mut workspace,
+                        resolution,
+                        path_arguments(paths)?,
+                    )?;
                     emit(
                         cli.json,
                         &serde_json::json!({"updated": updated, "view": workspace.projection()?.id()?}),
@@ -436,7 +560,9 @@ fn run(cli: Cli) -> Result<()> {
                         format!("Remote: {}", remote.as_deref().unwrap_or("local only")),
                     )
                 }
-                Commands::Init { .. } | Commands::Clone { .. } => unreachable!(),
+                Commands::Init { .. } | Commands::Clone { .. } | Commands::Import { .. } => {
+                    unreachable!()
+                }
             }
         }
     }

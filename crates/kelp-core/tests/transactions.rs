@@ -10,6 +10,7 @@ fn file(value: &str) -> FileEntry {
         blob: object_id("blob", value.as_bytes()),
         size: value.len() as u64,
         executable: false,
+        kind: Default::default(),
     }
 }
 

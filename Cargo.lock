@@ -303,6 +303,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "diffy"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e3dc2f773b6aaa63b1a7684b8589f670a8a0146a510b74d23a401c882364b49"
+dependencies = [
+ "hashbrown 0.17.1",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -780,11 +789,12 @@ dependencies = [
 
 [[package]]
 name = "kelp-cli"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "diffy",
  "fs2",
  "ignore",
  "kelp-core",
@@ -801,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "kelp-core"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -814,7 +824,7 @@ dependencies = [
 
 [[package]]
 name = "kelp-remote"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "anyhow",
  "axum",

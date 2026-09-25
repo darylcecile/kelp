@@ -18,6 +18,7 @@ services:
       KELP_TOKEN: ${KELP_TOKEN:?Set KELP_TOKEN for CLI access}
       KELP_STORAGE_TOKEN: ${KELP_STORAGE_TOKEN:?Set KELP_STORAGE_TOKEN for private storage traffic}
       KELP_SHARDS: http://storage-a:8080,http://storage-b:8080,http://storage-c:8080
+      KELP_REPLICAS: 2
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:

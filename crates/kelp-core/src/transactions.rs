@@ -7,7 +7,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    FileEntry, MAX_BLOB_BYTES, Snapshot, object_id, validate_hash, validate_name, validate_path,
+    EntryKind, FileEntry, Snapshot, object_id, validate_hash, validate_name, validate_path,
 };
 
 pub const PROTOCOL: &str = "kelp/1";
@@ -27,6 +27,8 @@ pub struct Transaction {
     pub nonce: String,
     pub message: String,
     pub edits: BTreeMap<String, Edit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<FileEntry>,
 }
 
 impl Transaction {
@@ -35,8 +37,18 @@ impl Transaction {
     }
 
     pub fn validate(&self) -> Result<()> {
-        ensure!(self.format == 1, "unsupported transaction format");
+        ensure!(
+            matches!(self.format, 1 | 2),
+            "unsupported transaction format"
+        );
         validate_name(&self.nonce)?;
+        if let Some(source) = &self.provenance {
+            source.validate()?;
+            ensure!(
+                self.format == 2 && !source.executable && !source.kind.is_symlink(),
+                "invalid transaction provenance"
+            );
+        }
         ensure!(
             !self.message.trim().is_empty() && self.message.len() <= 16_384,
             "describe the commit in 1–16384 bytes"
@@ -47,10 +59,10 @@ impl Transaction {
                 validate_hash(parent)?;
             }
             if let Some(value) = &edit.value {
-                validate_hash(&value.blob)?;
+                value.validate()?;
                 ensure!(
-                    value.size <= MAX_BLOB_BYTES as u64,
-                    "file too large: {path}"
+                    self.format == 2 || value.kind == EntryKind::Regular,
+                    "extended file entries require transaction format 2"
                 );
             }
         }
@@ -117,7 +129,7 @@ impl View {
         snapshot.validate()?;
         let conflicts = self.conflicts();
         let paths: BTreeSet<_> = self.files.keys().chain(snapshot.files.keys()).collect();
-        let edits = paths
+        let edits: BTreeMap<String, Edit> = paths
             .into_iter()
             .filter_map(|path| {
                 let heads = self.files.get(path);
@@ -140,10 +152,19 @@ impl View {
             })
             .collect();
         let transaction = Transaction {
-            format: 1,
+            format: if edits
+                .values()
+                .filter_map(|edit| edit.value.as_ref())
+                .any(|entry| entry.kind != EntryKind::Regular)
+            {
+                2
+            } else {
+                1
+            },
             nonce,
             message,
             edits,
+            provenance: None,
         };
         transaction.validate()?;
         Ok(transaction)
@@ -337,11 +358,19 @@ pub struct Project {
     pub protocol: String,
     pub layout: String,
     pub storage_nodes: usize,
+    #[serde(default = "one_replica")]
+    pub replicas: usize,
+}
+
+fn one_replica() -> usize {
+    1
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncRequest {
     pub cursors: Vec<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,6 +390,38 @@ pub struct JournalPage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Receipt {
     pub transaction: String,
+}
+
+/// An immutable name for a complete, committed release view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pin {
+    pub name: String,
+    pub snapshot: Snapshot,
+    pub roots: BTreeSet<String>,
+}
+
+impl Pin {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(self.name.len() <= 128, "tag name is too long");
+        validate_path(&self.name)?;
+        self.snapshot.validate()?;
+        for root in &self.roots {
+            validate_hash(root)?;
+        }
+        Ok(())
+    }
+    pub fn id(&self) -> Result<String> {
+        Ok(object_id("pin", &serde_json::to_vec(self)?))
+    }
+    pub fn view(&self) -> Result<SavedView> {
+        Ok(SavedView {
+            format: 1,
+            snapshot: self.snapshot.id()?,
+            roots: self.roots.clone(),
+            paths: Vec::new(),
+        })
+    }
 }
 
 /// A fixed topology maps content and its journal receipt to the same owner.

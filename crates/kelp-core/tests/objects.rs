@@ -12,6 +12,7 @@ fn snapshots_are_reproducible_and_corrupt_content_is_rejected() -> anyhow::Resul
         blob: blob.clone(),
         size: bytes.len() as u64,
         executable: false,
+        kind: Default::default(),
     };
     let mut first = Snapshot::default();
     first.files.insert("z.txt".into(), file.clone());
@@ -37,6 +38,7 @@ fn a_snapshot_cannot_escape_a_checkout_or_replace_its_metadata() {
         blob: object_id("blob", b"data"),
         size: 4,
         executable: false,
+        kind: Default::default(),
     };
     for path in [
         "../outside",
@@ -44,8 +46,8 @@ fn a_snapshot_cannot_escape_a_checkout_or_replace_its_metadata() {
         "a/../../escape",
         ".kelp/workspace.sqlite3",
         ".git/config",
-        "a\\b",
-        "C:/file",
+        "a/\0ff00",
+        "a/\0ff2f",
     ] {
         let snapshot = Snapshot {
             files: BTreeMap::from([(path.into(), file.clone())]),

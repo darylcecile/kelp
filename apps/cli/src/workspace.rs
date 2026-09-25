@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -11,9 +11,10 @@ use crate::selection;
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use ignore::WalkBuilder;
+use kelp_core::paths;
 use kelp_core::{
-    FileEntry, MAX_BLOB_BYTES, MAX_METADATA_BYTES, Snapshot, storage,
-    transactions::{Graph, SavedView, Transaction, View},
+    EntryKind, FileEntry, MAX_BLOB_BYTES, MAX_METADATA_BYTES, Snapshot, content, storage,
+    transactions::{Graph, Pin, SavedView, Transaction, View},
     validate_name, validate_path,
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -174,7 +175,7 @@ impl Workspace {
         let bytes = storage::decode_record(&encoded)?;
         let mut state: WorkspaceState = serde_json::from_slice(&bytes)?;
         ensure!(
-            state.version <= 2,
+            state.version <= 3,
             "unsupported workspace version {}",
             state.version
         );
@@ -183,7 +184,7 @@ impl Workspace {
             "invalid checkout path selection"
         );
         ensure!(
-            state.paths.is_empty() || state.version == 2,
+            state.paths.is_empty() || state.version >= 2,
             "partial checkout requires workspace format 2"
         );
         let columns = db
@@ -376,15 +377,18 @@ impl Workspace {
     }
 
     pub fn save_state(&self) -> Result<()> {
+        let mut state = self.state.clone();
+        state.version = 3;
         self.db.execute(
             "INSERT INTO workspace(id, state) VALUES (1, ?1) ON CONFLICT(id) DO UPDATE SET state = excluded.state",
-            [storage::encode_record(&serde_json::to_vec(&self.state)?)?],
+            [storage::encode_record(&serde_json::to_vec(&state)?)?],
         )?;
         Ok(())
     }
 
     pub fn capture(&self, message: Option<&str>) -> Result<Checkpoint> {
         let tx = self.db.unchecked_transaction()?;
+        self.save_state()?;
         let snapshot = self.scan(Some(&tx))?;
         let encoded = serde_json::to_vec(&snapshot)?;
         let id = storage::put(&tx, &self.state.project, "snapshot", &encoded)?;
@@ -574,11 +578,28 @@ impl Workspace {
         file_changes(before, after)
             .into_iter()
             .map(|file| {
+                if before
+                    .files
+                    .get(&file.path)
+                    .into_iter()
+                    .chain(after.files.get(&file.path))
+                    .any(|entry| entry.size > MAX_BLOB_BYTES as u64)
+                {
+                    let describe = |snapshot: &Snapshot| {
+                        snapshot
+                            .files
+                            .get(&file.path)
+                            .map(|entry| format!("{} bytes ({})", entry.size, entry.blob))
+                            .unwrap_or_else(|| "absent".into())
+                    };
+                    return Ok(FileDiff {
+                        diff: format!("Large file: {} → {}\n", describe(before), describe(after)),
+                        file,
+                    });
+                }
                 let bytes = |snapshot: &Snapshot| -> Result<Vec<u8>> {
                     match snapshot.files.get(&file.path) {
-                        Some(entry) => {
-                            storage::get(&self.db, &self.state.project, "blob", &entry.blob)
-                        }
+                        Some(entry) => content::read(&self.db, &self.state.project, entry),
                         None => Ok(Vec::new()),
                     }
                 };
@@ -588,8 +609,8 @@ impl Workspace {
                         similar::TextDiff::from_lines(old, new)
                             .unified_diff()
                             .header(
-                                &format!("before/{}", file.path),
-                                &format!("after/{}", file.path),
+                                &format!("before/{}", paths::display(&file.path)),
+                                &format!("after/{}", paths::display(&file.path)),
                             )
                             .to_string()
                     }
@@ -807,21 +828,49 @@ impl Workspace {
         let mut cache_updates = BTreeMap::new();
         for path in &paths {
             validate_path(path)?;
+            let mut prefix = path.as_str();
+            let mut replaced_parent = false;
+            while let Some((parent, _)) = prefix.rsplit_once('/') {
+                if paths.contains(parent)
+                    && fs::symlink_metadata(self.root.join(paths::to_native(parent)?))
+                        .is_ok_and(|metadata| !metadata.is_dir())
+                {
+                    replaced_parent = true;
+                    break;
+                }
+                prefix = parent;
+            }
+            if replaced_parent {
+                continue;
+            }
             check_ancestors(&self.root, path)?;
-            let full = self.root.join(path);
+            let full = self.root.join(paths::to_native(path)?);
             let metadata = match fs::symlink_metadata(&full) {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.into()),
             };
+            if metadata.is_dir() {
+                continue;
+            }
             ensure!(
-                metadata.is_file(),
-                "only regular files are supported: {path}"
+                metadata.is_file() || metadata.is_symlink(),
+                "only files and symlinks are supported: {path}"
             );
-            ensure!(
-                metadata.len() <= MAX_BLOB_BYTES as u64,
-                "{path} exceeds the 16 MiB file limit"
-            );
+            if metadata.is_symlink() {
+                let bytes = link_bytes(&fs::read_link(&full)?)?;
+                let kind = link_kind(&metadata);
+                files.insert(
+                    path.clone(),
+                    FileEntry {
+                        blob: storage::put(&self.db, &self.state.project, "blob", &bytes)?,
+                        size: bytes.len() as u64,
+                        executable: false,
+                        kind,
+                    },
+                );
+                continue;
+            }
             let fingerprint = index::fingerprint(&metadata);
             if let Some((fingerprint, changed_at)) = &fingerprint
                 && let Some(cached) = cache.get(path)
@@ -840,6 +889,29 @@ impl Workspace {
                 .get(path)
                 .or_else(|| previous.files.get(path))
                 .is_some_and(|entry| entry.executable);
+            if metadata.len() > MAX_BLOB_BYTES as u64 {
+                let captured_at = index::timestamp();
+                let entry = content::store(
+                    &self.db,
+                    &self.state.project,
+                    File::open(&full)?,
+                    metadata.len(),
+                    executable,
+                )?;
+                let stable = fingerprint == index::fingerprint(&fs::symlink_metadata(&full)?);
+                if let Some((fingerprint, _)) = fingerprint.filter(|_| stable) {
+                    cache_updates.insert(
+                        path.clone(),
+                        index::CachedFile {
+                            fingerprint,
+                            captured_at,
+                            entry: entry.clone(),
+                        },
+                    );
+                }
+                files.insert(path.clone(), entry);
+                continue;
+            }
             missing.push((path.clone(), full, metadata, executable));
         }
         // Overlap cold file-open latency, bounded independently of project size.
@@ -895,6 +967,7 @@ impl Workspace {
                     blob,
                     size: bytes.len() as u64,
                     executable,
+                    kind: EntryKind::Regular,
                 };
                 if let Some((fingerprint, _)) = fingerprint {
                     cache_updates.insert(
@@ -918,6 +991,18 @@ impl Workspace {
     }
 
     pub fn resolve(&self, reference: &str) -> Result<(String, String)> {
+        let pins: Vec<_> = self
+            .pins()?
+            .into_iter()
+            .filter(|pin| pin.name == reference)
+            .collect();
+        if !pins.is_empty() {
+            ensure!(
+                pins.len() == 1,
+                "tag {reference} has conflicting views; use an exact view hash from `kelp tag`"
+            );
+            return Ok(("saved-view".into(), pins[0].view()?.id()?));
+        }
         let (kind, prefix) = if let Some(prefix) = reference.strip_prefix("view:") {
             (Some("saved-view"), prefix)
         } else if let Some(prefix) = reference.strip_prefix("commit:") {
@@ -951,6 +1036,83 @@ impl Workspace {
             }
         }
         Ok(hash.into())
+    }
+
+    pub fn pins(&self) -> Result<Vec<Pin>> {
+        storage::ids(&self.db, &self.state.project, "pin")?
+            .into_iter()
+            .map(|id| storage::get_json(&self.db, &self.state.project, "pin", &id))
+            .collect()
+    }
+
+    pub fn remember_pin(&self, pin: &Pin) -> Result<()> {
+        pin.validate()?;
+        storage::put_json(&self.db, &self.state.project, "snapshot", &pin.snapshot)?;
+        storage::put_json(&self.db, &self.state.project, "saved-view", &pin.view()?)?;
+        storage::put_json(&self.db, &self.state.project, "pin", pin)?;
+        Ok(())
+    }
+
+    pub fn tag(&self, name: String, reference: Option<&str>) -> Result<Pin> {
+        let hash = if let Some(reference) = reference {
+            let (kind, hash) = self.resolve(reference)?;
+            ensure!(
+                kind == "saved-view",
+                "tag a saved view, not an edit transaction"
+            );
+            hash
+        } else {
+            self.checkpoints(1)?
+                .pop()
+                .context("commit a version before tagging it")?
+                .view
+        };
+        let view: SavedView =
+            storage::get_json(&self.db, &self.state.project, "saved-view", &hash)?;
+        ensure!(
+            view.paths.is_empty(),
+            "expand to a full checkout before pinning a release view"
+        );
+        let snapshot: Snapshot =
+            storage::get_json(&self.db, &self.state.project, "snapshot", &view.snapshot)?;
+        let graph = self.graph_from_roots(&view.roots)?;
+        ensure!(
+            graph.view()?.snapshot()? == snapshot,
+            "this saved view contains uncommitted work; commit it before tagging"
+        );
+        let pin = Pin {
+            name,
+            snapshot,
+            roots: view.roots,
+        };
+        pin.validate()?;
+        for previous in self
+            .pins()?
+            .into_iter()
+            .filter(|previous| previous.name == pin.name)
+        {
+            ensure!(
+                previous.id()? == pin.id()?,
+                "this tag already identifies a different view"
+            );
+        }
+        self.remember_pin(&pin)?;
+        Ok(pin)
+    }
+
+    pub fn graph_from_roots(&self, roots: &BTreeSet<String>) -> Result<Graph> {
+        let mut graph = Graph::default();
+        let mut todo: Vec<_> = roots.iter().cloned().collect();
+        while let Some(id) = todo.pop() {
+            if graph.transactions.contains_key(&id) {
+                continue;
+            }
+            let transaction = self.transaction(&id)?;
+            todo.extend(transaction.dependencies());
+            graph.transactions.insert(id, transaction);
+        }
+        graph.validate()?;
+        Ok(graph)
     }
 
     pub fn show_reference(&self, reference: &str) -> Result<Vec<FileDiff>> {
@@ -987,16 +1149,28 @@ impl Workspace {
         let view: SavedView =
             storage::get_json(&self.db, &self.state.project, "saved-view", &hash)?;
         ensure!(
-            matches!(view.format, 1 | 2) && view.paths == self.state.paths,
-            "this saved view covers a different path selection; restore it in a checkout with the same selection"
+            matches!(view.format, 1 | 2)
+                && if view.paths.is_empty() {
+                    self.state.paths.is_empty()
+                } else {
+                    view.paths.iter().all(|path| self.includes(path))
+                },
+            "this saved view covers a different path selection; expand this checkout before restoring it"
         );
-        let target = storage::get_json(&self.db, &self.state.project, "snapshot", &view.snapshot)?;
+        let target: Snapshot =
+            storage::get_json(&self.db, &self.state.project, "snapshot", &view.snapshot)?;
         let backup = self.capture(Some(&format!(
             "Before restoring {}",
             self.short_hash(&hash)?
         )))?;
-        self.apply_snapshot(&self.checkpoint_snapshot(backup.id)?, &target)?;
-        self.state.tracked = target.files.keys().cloned().collect();
+        let current = self.checkpoint_snapshot(backup.id)?;
+        let mut merged = current.clone();
+        merged
+            .files
+            .retain(|path, _| !selection::includes(&view.paths, path));
+        merged.files.extend(target.files);
+        self.apply_snapshot(&current, &merged)?;
+        self.state.tracked = merged.files.keys().cloned().collect();
         self.save_state()?;
         self.capture(Some(&format!("Restored {}", self.short_hash(&hash)?)))?;
         Ok((hash, backup.view))
@@ -1040,7 +1214,7 @@ impl Workspace {
             let mut prefix = PathBuf::new();
             let parts: Vec<_> = path.split('/').collect();
             for part in &parts[..parts.len() - 1] {
-                prefix.push(part);
+                prefix.push(paths::to_native(part)?);
                 if directories.insert(prefix.clone()) {
                     fs::create_dir(shape.path().join(&prefix)).with_context(|| {
                         format!(
@@ -1050,19 +1224,41 @@ impl Workspace {
                     })?;
                 }
             }
-            File::create_new(shape.path().join(path))
+            File::create_new(shape.path().join(paths::to_native(path)?))
                 .with_context(|| format!("this filesystem cannot represent file {path}"))?;
+        }
+        for (path, entry) in &target.files {
+            if entry.kind.is_symlink() {
+                let link = shape.path().join(paths::to_native(path)?);
+                fs::remove_file(&link)?;
+                create_link(
+                    &content::read(&self.db, &self.state.project, entry)?,
+                    &link,
+                    entry.kind,
+                )?;
+            }
         }
         ensure!(
             self.scan(None)? == *current,
             "files changed while preparing the update; try again"
         );
+        let removed: BTreeSet<_> = current
+            .files
+            .keys()
+            .filter(|path| !target.files.contains_key(*path))
+            .cloned()
+            .collect();
         for path in target.files.keys() {
-            check_ancestors(&self.root, path)?;
+            check_ancestors_after(&self.root, path, Some(&removed))?;
             if !current.files.contains_key(path)
-                && fs::symlink_metadata(self.root.join(path)).is_ok()
+                && fs::symlink_metadata(self.root.join(paths::to_native(path)?)).is_ok()
             {
-                bail!("cannot replace an ignored file or directory at {path}");
+                let prefix = format!("{path}/");
+                ensure!(
+                    current.files.keys().any(|file| file.starts_with(&prefix))
+                        && removable_directory(&self.root, path, &removed)?,
+                    "cannot replace an ignored file or directory at {path}"
+                );
             }
         }
         for path in current
@@ -1070,22 +1266,40 @@ impl Workspace {
             .keys()
             .filter(|path| !target.files.contains_key(*path))
         {
-            fs::remove_file(self.root.join(path))?;
+            let full = self.root.join(paths::to_native(path)?);
+            remove_file(&full)?;
+            let mut parent = full.parent();
+            while let Some(directory) = parent {
+                if directory == self.root || fs::remove_dir(directory).is_err() {
+                    break;
+                }
+                parent = directory.parent();
+            }
         }
         for (path, entry) in &target.files {
             if current.files.get(path) == Some(entry) {
                 continue;
             }
-            let full = self.root.join(path);
+            let full = self.root.join(paths::to_native(path)?);
             let parent = full.parent().context("file has no parent directory")?;
             fs::create_dir_all(parent)?;
             let mut file = tempfile::NamedTempFile::new_in(parent)?;
-            file.write_all(&storage::get(
-                &self.db,
-                &self.state.project,
-                "blob",
-                &entry.blob,
-            )?)?;
+            if entry.kind.is_symlink() {
+                let staging = tempfile::tempdir_in(parent)?;
+                let link = staging.path().join("link");
+                create_link(
+                    &content::read(&self.db, &self.state.project, entry)?,
+                    &link,
+                    entry.kind,
+                )?;
+                #[cfg(windows)]
+                if fs::symlink_metadata(&full).is_ok() {
+                    remove_file(&full)?;
+                }
+                fs::rename(link, &full).with_context(|| format!("write symlink {path}"))?;
+                continue;
+            }
+            content::write(&self.db, &self.state.project, entry, &mut file)?;
             set_executable(file.as_file(), entry.executable)?;
             file.as_file().sync_all()?;
             file.persist(&full)
@@ -1198,11 +1412,10 @@ fn discover_selected_files(root: &Path, paths: &[String]) -> Result<BTreeSet<Str
                 .path()
                 .strip_prefix(&directory)
                 .ok()
-                .and_then(|path| path.to_str())
+                .and_then(|path| paths::from_native(path).ok())
             else {
                 return false;
             };
-            let path = path.replace(std::path::MAIN_SEPARATOR, "/");
             if entry.file_type().is_some_and(|kind| kind.is_dir()) {
                 selection::intersects(&selected, &path)
             } else {
@@ -1214,27 +1427,112 @@ fn discover_selected_files(root: &Path, paths: &[String]) -> Result<BTreeSet<Str
         if entry.file_type().is_some_and(|kind| kind.is_dir()) {
             continue;
         }
-        let path = entry
-            .path()
-            .strip_prefix(root)?
-            .to_str()
-            .context("file paths must be UTF-8")?
-            .replace(std::path::MAIN_SEPARATOR, "/");
+        let path = paths::from_native(entry.path().strip_prefix(root)?)?;
         validate_path(&path)?;
         ensure!(
-            entry.file_type().is_some_and(|kind| kind.is_file()),
-            "symlinks and special files are not supported: {path}"
+            entry
+                .file_type()
+                .is_some_and(|kind| kind.is_file() || kind.is_symlink()),
+            "special files are not supported: {path}"
         );
         files.insert(path);
     }
     Ok(files)
 }
 
+#[cfg(unix)]
+fn link_bytes(path: &Path) -> Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(path.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(not(unix))]
+fn link_bytes(path: &Path) -> Result<Vec<u8>> {
+    Ok(path
+        .to_str()
+        .context("symlink target must be UTF-8 on this platform")?
+        .as_bytes()
+        .to_vec())
+}
+
+fn link_kind(metadata: &fs::Metadata) -> EntryKind {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        if metadata.file_type().is_symlink_dir() {
+            return EntryKind::SymlinkDirectory;
+        }
+    }
+    let _ = metadata;
+    EntryKind::Symlink
+}
+
+fn remove_file(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        if fs::symlink_metadata(path)?.file_type().is_symlink_dir() {
+            fs::remove_dir(path)?;
+            return Ok(());
+        }
+    }
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+fn create_link(bytes: &[u8], path: &Path, kind: EntryKind) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let _ = kind;
+        std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(bytes), path)?;
+    }
+    #[cfg(windows)]
+    {
+        let target = std::str::from_utf8(bytes)?;
+        if kind == EntryKind::SymlinkDirectory {
+            std::os::windows::fs::symlink_dir(target, path)?;
+        } else {
+            std::os::windows::fs::symlink_file(target, path)?;
+        }
+    }
+    Ok(())
+}
+
 fn check_ancestors(root: &Path, path: &str) -> Result<()> {
+    check_ancestors_after(root, path, None)
+}
+
+fn removable_directory(root: &Path, path: &str, removed: &BTreeSet<String>) -> Result<bool> {
+    let mut directories = vec![root.join(paths::to_native(path)?)];
+    while let Some(directory) = directories.pop() {
+        if !fs::symlink_metadata(&directory)?.is_dir() {
+            return Ok(false);
+        }
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                directories.push(entry.path());
+            } else if !removed.contains(&paths::from_native(entry.path().strip_prefix(root)?)?) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn check_ancestors_after(
+    root: &Path,
+    path: &str,
+    removed: Option<&BTreeSet<String>>,
+) -> Result<()> {
     let mut parent = root.to_owned();
     let parts: Vec<_> = path.split('/').collect();
-    for part in &parts[..parts.len() - 1] {
-        parent.push(part);
+    for (index, part) in parts[..parts.len() - 1].iter().enumerate() {
+        if removed.is_some_and(|removed| removed.contains(&parts[..=index].join("/"))) {
+            return Ok(());
+        }
+        parent.push(paths::to_native(part)?);
         match fs::symlink_metadata(&parent) {
             Ok(metadata) => ensure!(
                 metadata.is_dir() && !metadata.is_symlink(),

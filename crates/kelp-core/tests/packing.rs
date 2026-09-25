@@ -24,6 +24,7 @@ fn packing_preserves_every_object_hash_and_conflict_and_supports_more_writes() -
     let mut graph = Graph::default();
     for (index, (blob, bytes)) in objects.iter().take(2).enumerate() {
         let transaction = Transaction {
+            provenance: None,
             format: 1,
             nonce: format!("n{index}"),
             message: "Competing edit".into(),
@@ -35,6 +36,7 @@ fn packing_preserves_every_object_hash_and_conflict_and_supports_more_writes() -
                         blob: blob.clone(),
                         size: bytes.len() as u64,
                         executable: false,
+                        kind: Default::default(),
                     }),
                 },
             )]),

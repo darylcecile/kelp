@@ -120,6 +120,7 @@ fn snapshot_only_workspaces_keep_their_history_and_can_enter_transaction_sync() 
                 blob,
                 size: 5,
                 executable: false,
+                kind: Default::default(),
             },
         )]
         .into(),

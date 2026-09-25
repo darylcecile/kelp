@@ -2,13 +2,13 @@
 
 Version control built around independent edits. Teammates working on different files can push without taking turns or rewriting each other's commits. A remote can distribute one project's files and history across storage nodes.
 
-**Version 0.0.3:** an experimental, transaction-based release with partial checkouts. For another version, use the README at its release tag.
+**Version 0.0.4:** transaction-based version control with large files, symlinks, text merging, partial checkouts, and replicated remote storage. For another version, use the README at its release tag.
 
 ## Install
 
 Download your platform's archive from [GitHub Releases](https://github.com/darylcecile/kelp/releases), extract `kelp` (`kelp.exe` on Windows), and place it on your `PATH`. Run `kelp --version` to check it. Releases include SHA-256 checksums.
 
-Upgrading from 0.0.2? Full checkouts remain compatible, and partial clones work with 0.0.2 or newer remotes. Partial checkouts require a 0.0.3 or newer CLI. From 0.0.1, existing saved snapshots remain recoverable; explicitly commit the desired files to enter transaction synchronization and use a 0.0.2 or newer remote. Opening a 0.0.1 database upgrades its storage format, so retain a backup if you need to return to that binary.
+Use matching 0.0.4 CLI, gateway, and storage-node builds for the new features. Existing saved views and regular-file hashes remain valid. Workspaces upgrade to a format older CLIs cannot open. For existing distributed deployments, follow the [replica upgrade instructions](apps/remote/README.md#replication-and-node-evacuation) before enabling replicated operation.
 
 ## Save locally
 
@@ -49,7 +49,7 @@ kelp push
 kelp pull
 ```
 
-Different-file commits combine without a pull-before-push requirement. If people commit different edits to the same file, both versions are retained and pull reports the conflict.
+Different-file commits combine without a pull-before-push requirement. Pull also merges non-overlapping text edits using their common file ancestor. Original transactions remain intact; commit the merged result when ready. Overlapping edits, binary alternatives, and structural conflicts remain explicit:
 
 ```sh
 kelp pull --keep-local       # Or --keep-remote.
@@ -58,7 +58,7 @@ kelp commit -m "Resolve the competing edits"
 kelp push
 ```
 
-The resolution records both alternatives as parents; it does not erase either original commit. Conflicts affecting the selected files must be resolved before a clean clone of those files can be made.
+The resolution records both alternatives as parents; it does not erase either original commit. Clone can materialize a clean text merge. Overlapping conflicts affecting selected files must be resolved before cloning those files.
 
 ## Work on part of a project
 
@@ -80,7 +80,36 @@ kelp clone https://code.example.com/my-project --paths services/api,libs/http --
 
 Paths are project-relative file/directory prefixes, not globs. `status` shows the active selection. Include root build files, ignore files, or other dependencies explicitly if your work needs them.
 
-Kelp retains complete transaction metadata for the project, but downloads historical file contents only for selected paths. Cross-directory commits keep their original identity and meaning. This reduces file storage/transfer; it is not a path-permission boundary or a full backup. Copying history to another remote can require a full clone because excluded file contents are unavailable locally.
+Kelp retrieves transactions relevant to your selection and their dependencies, plus historical file contents for selected paths. Unrelated history stays on the remote. Cross-directory transactions remain complete and keep their original identity. Selection controls downloading, not access permissions.
+
+Expand your checkout whenever you need more of the project:
+
+```sh
+kelp pull --paths libs/http
+kelp pull --paths .          # Download the rest of the project.
+```
+
+Existing drafts are preserved. If a newly selected path already contains different local work, pull asks you to choose a version with the usual conflict options. Expand fully before using a checkout as a complete project backup or copying all history to another remote.
+
+## Import Git history
+
+```sh
+kelp import ../existing-git-project my-project
+cd my-project
+kelp push https://code.example.com/my-project
+```
+
+Import reads the selected Git revision and its ancestry, including merge results, file modes, symlinks, and reachable tags. Use `--ref BRANCH` to choose a revision. Author/committer information and original Git commit bytes are retained as provenance. Git must be installed for import. The source repository and its unfinished files are preserved; only committed Git bytes are imported. External Git LFS payloads and submodule projects remain external to that history.
+
+## Pin a release view
+
+```sh
+kelp tag v1.0
+kelp push
+kelp restore v1.0
+```
+
+`tag NAME [VIEW_HASH]` gives a committed, complete saved view an immutable name. `kelp tag` lists names and view hashes. Tags travel with push, clone, and pull; they remain available after compaction. A tag cannot be moved onto a different view. Independently created conflicting names retain both views and require an exact hash to disambiguate.
 
 ## Inspect your work
 
@@ -101,7 +130,7 @@ Both commits and saved views use hashes, displayed as short, unambiguous prefixe
 kelp restore <view-hash>
 ```
 
-This restores the current folder and first saves a labelled backup of your work. The output gives the backup's view hash. Ignored files and Kelp metadata remain. In a partial checkout, only selected paths are restored, and saved-view hashes include that selection. Restore rejects views from a different selection. A commit hash alone is not a restore target because it may describe only an independent edit to one file.
+This restores the current folder and first saves a labelled backup of your work. The output gives the backup's view hash. Ignored files and Kelp metadata remain. Partial saved views restore their original selected paths, including after checkout expansion; newly included paths remain untouched. Expand first if a view covers paths you have not downloaded. A commit hash alone is not a restore target because it may describe only an independent edit to one file.
 
 Restore changes working files. To share the restored result, commit it and push:
 
@@ -118,15 +147,13 @@ kelp gc
 
 This losslessly packs stored objects and reclaims unused database pages. It keeps every commit, conflicting alternative, saved view, and recovery backup. Existing hashes continue to work. It does not commit unfinished files or push anything.
 
-On the documented 1,000-file/101-commit benchmark, maintained Kelp storage is about 324 KB versus Git's 330 KB. Results depend on the project; [the benchmark report](benchmarks/README.md#lossless-compaction-measurements) includes the read-time tradeoff.
+On the documented v0.0.2 1,000-file/101-commit benchmark, maintained Kelp storage was about 324 KB versus Git's 330 KB. Results depend on the project; [the benchmark report](benchmarks/README.md#lossless-compaction-measurements) includes the read-time tradeoff.
 
-## Current limits
+## Files and remote storage
 
-- Regular, portable UTF-8-path files up to 16 MiB; no symlinks or large-file chunking yet.
-- Conflicts are handled at file level, not automatically merged within a file.
-- Partial selection is set when cloning; expanding an existing checkout is not yet supported. The complete transaction metadata is still downloaded.
-- Replication, automated storage-node evacuation, Git import, and release-view pinning are future work.
-- The distributed preview stores one copy of each object. Backups remain necessary for permanent node loss.
+Large files are streamed into reusable chunks automatically; the 16 MiB file ceiling is gone. Symlinks retain their targets rather than copying target contents. Native filenames, including non-UTF-8 names on Unix, are preserved losslessly. Checkout verifies that the destination filesystem can represent the requested names and symlinks before replacing files.
+
+Distributed gateways default to two durable copies of objects, transaction journals, and release tags across storage nodes. With three nodes, one can be unavailable while reads and writes continue. The remote includes commands to repair replica placement and evacuate a retiring node. See the [remote guide](apps/remote/README.md#replication-and-node-evacuation) for deployment and recovery operations.
 
 Kelp caches validated file state, compresses/batches object transfers, and can compact local storage into bounded packs. [Benchmark method and results](benchmarks/README.md) describe the measured space and latency, including comparisons where Git performs better.
 

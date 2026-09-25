@@ -1,7 +1,9 @@
 //! Shared immutable content and the transaction model used by the CLI/remotes.
 //! The object hash envelope stays stable across network protocol versions.
 
+pub mod content;
 mod delta;
+pub mod paths;
 pub mod storage;
 pub mod transactions;
 pub mod transfer;
@@ -17,12 +19,48 @@ pub const OBJECT_FORMAT: &str = "kelp/0";
 pub const MAX_BLOB_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_METADATA_BYTES: usize = 2 * 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FileEntry {
     pub blob: String,
     pub size: u64,
     pub executable: bool,
+    #[serde(default, skip_serializing_if = "EntryKind::is_regular")]
+    pub kind: EntryKind,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "kebab-case")]
+pub enum EntryKind {
+    #[default]
+    Regular,
+    Chunked,
+    Symlink,
+    SymlinkDirectory,
+}
+
+impl EntryKind {
+    fn is_regular(&self) -> bool {
+        *self == Self::Regular
+    }
+    pub fn is_symlink(self) -> bool {
+        matches!(self, Self::Symlink | Self::SymlinkDirectory)
+    }
+}
+
+impl FileEntry {
+    pub fn validate(&self) -> Result<()> {
+        validate_hash(&self.blob)?;
+        ensure!(
+            self.kind == EntryKind::Chunked || self.size <= MAX_BLOB_BYTES as u64,
+            "unchunked file exceeds object size limit"
+        );
+        ensure!(
+            !self.kind.is_symlink() || !self.executable,
+            "symlinks cannot carry executable mode"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -35,11 +73,7 @@ impl Snapshot {
     pub fn validate(&self) -> Result<()> {
         for (path, entry) in &self.files {
             validate_path(path)?;
-            validate_hash(&entry.blob)?;
-            ensure!(
-                entry.size <= MAX_BLOB_BYTES as u64,
-                "file too large: {path}"
-            );
+            entry.validate()?;
             let mut parent = path.as_str();
             while let Some((prefix, _)) = parent.rsplit_once('/') {
                 ensure!(
@@ -151,22 +185,7 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// v0 uses portable UTF-8 relative paths; metadata directories are never files.
+/// Relative native file names, excluding traversal and metadata directories.
 pub fn validate_path(path: &str) -> Result<()> {
-    ensure!(!path.is_empty(), "empty file path");
-    for part in path.split('/') {
-        ensure!(
-            !part.is_empty()
-                && part != "."
-                && part != ".."
-                && !part.eq_ignore_ascii_case(".kelp")
-                && !part.eq_ignore_ascii_case(".git")
-                && !part.ends_with(['.', ' '])
-                && !part
-                    .chars()
-                    .any(|c| c.is_control() || "\\:<>\"|?*".contains(c)),
-            "unsupported file path: {path}"
-        );
-    }
-    Ok(())
+    paths::validate(path)
 }

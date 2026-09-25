@@ -58,6 +58,7 @@ fn hash_prefixes_are_rejected_when_ambiguous_instead_of_selecting_a_version() ->
     let mut prefixes = std::collections::BTreeMap::new();
     for nonce in 0..2000 {
         let transaction = Transaction {
+            provenance: None,
             format: 1,
             nonce: format!("n-{nonce}"),
             message: "Empty commit".into(),

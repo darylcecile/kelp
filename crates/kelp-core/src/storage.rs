@@ -325,6 +325,11 @@ pub fn find(
         .collect::<Result<_, _>>()?)
 }
 
+pub fn ids(db: &Connection, namespace: &str, kind: &str) -> Result<Vec<String>> {
+    Ok(db.prepare("SELECT lower(hex(o.hash)) FROM object_index o JOIN storage_namespaces n ON n.id=o.namespace JOIN storage_kinds k ON k.id=o.kind WHERE n.name=?1 AND k.name=?2 ORDER BY o.hash")?
+        .query_map(params![namespace,kind], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?)
+}
+
 pub fn put_json<T: Serialize>(
     db: &Connection,
     namespace: &str,
@@ -344,11 +349,8 @@ pub fn get_json<T: DeserializeOwned>(
 
 pub fn verify_snapshot(db: &Connection, namespace: &str, snapshot: &Snapshot) -> Result<()> {
     snapshot.validate()?;
-    for (path, file) in &snapshot.files {
-        ensure!(
-            get(db, namespace, "blob", &file.blob)?.len() as u64 == file.size,
-            "size mismatch for {path}"
-        );
+    for file in snapshot.files.values() {
+        crate::content::write(db, namespace, file, &mut std::io::sink())?;
     }
     Ok(())
 }

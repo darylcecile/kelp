@@ -16,7 +16,7 @@ Each node has an independent durable database. The same binaries can run on diff
 
 ## Placement
 
-The owner is selected by hashing `(project, object kind, object ID)` over the configured node list. A transaction and its journal receipt have one owner. File contents referenced by that transaction can live on other nodes.
+The preferred owner is selected by hashing `(project, object kind, object ID)` over the configured node list. Each object and transaction journal entry is replicated to R distinct nodes, beginning at that owner and continuing through the member ring. Unavailable destinations are replaced by reachable members before acknowledgment. File chunks can live on different nodes from their transaction.
 
 Each node may losslessly pack its local objects. Pack offsets and compression relationships are physical storage details, not new transaction dependencies. The node returns the same logical bytes and hashes through the existing object endpoints, so no cross-node decoding chain or project-wide repacking lock is required.
 
@@ -36,7 +36,7 @@ CLI                       gateway                  storage nodes
  │◄────────────────────────────── receipt = transaction ID
 ```
 
-The gateway validates parent transactions and the availability/length of new file objects. Only then does the owner atomically store the transaction object and append its journal row. A duplicate ID returns the same logical receipt.
+The gateway validates parent transactions and replicated file/chunk availability. Each target atomically stores the transaction and its journal row. A receipt requires R acknowledgments. Copy counts in object-info responses let retries repair incomplete replication instead of treating the first visible copy as fully durable.
 
 There is no expected global head. Another writer adding an unrelated transaction does not invalidate this one. Overlapping writes are also retained; their conflict is part of the derived view rather than being resolved by whichever gateway received a request first.
 
@@ -46,7 +46,7 @@ File bytes are immutable and uploaded before publication. One transaction record
 
 This is an append-only, conflict-preserving model. It does **not** promise that every accepted combination is conflict-free or passes application tests. A system that instead promises one globally clean, immediately current branch would need a coordinated acceptance layer.
 
-Kelp can later add such a layer for named releases or protected integration views. It would pin selected transaction sets, not become the mandatory write path for all independent work.
+Immutable release pins select committed, conflict-free views without becoming the mandatory write path for independent work. Protected integration policy can build on those exact view identities.
 
 ## Read and synchronization path
 
@@ -73,16 +73,16 @@ A new node can be added to the gateway configuration for an existing project:
 
 Transaction IDs, local commit identities, and project URLs do not need to change. Operators must update the gateways to the same membership list; a gateway with an older list cannot discover the new node's journal until reconfigured.
 
-**Node removal is different.** Data and journal entries must first be evacuated. Automated evacuation and read-repair rebalancing are not implemented. Removing a nonempty member from discovery is not a supported operation.
+**Node removal uses evacuation.** `--evacuate URL` persistently drains that node, walks its bounded inventory pages, and copies its objects, journals, and release pins to R remaining nodes. The operation is restartable and retains source data. Only after completion are gateways switched to the reported remaining topology. `--repair` restores placement across a supplied membership list, including migration from older single-copy stores.
 
 ## What scales, and what does not yet
 
 | Work | Current mechanism | Remaining constraint |
 | --- | --- | --- |
-| Store one project's bytes | Hash-partitioned objects | Single copy per object; no erasure coding/replication |
+| Store one project's bytes | Hash-partitioned, replicated objects and chunks | Replica storage grows with the configured durability factor |
 | Accept independent transactions | Independently owned journal appends | Each node still serializes its own SQLite writes |
 | Add request frontends | Stateless gateways | Gateway validation can fan out to dependency owners |
-| Discover new work | Parallel per-node journal reads | Complete discovery requires all configured nodes |
+| Discover new work | Parallel, path-indexed journal reads | At most R−1 members may be unavailable |
 | Add storage capacity | Expanded placement plus fallback reads | Older objects may incur extra probes |
 | Materialize a project | Cached file frontiers, extended from new transactions | Current map/membership processing still grows; paged indexes are future work |
 
@@ -90,16 +90,17 @@ Physical partitioning and independent acceptance are implemented behaviors. Line
 
 ## Durability and failures
 
-Storage nodes commit with SQLite WAL and full synchronous durability. A receipt acknowledges the owner's durable transaction/journal write, not replicated or geo-durable storage.
+Storage nodes commit with SQLite WAL and full synchronous durability. A receipt acknowledges R durable copies on distinct configured nodes. Geographic/failure-domain separation remains an operator deployment responsibility.
 
 | Failure | Behavior |
 | --- | --- |
 | Upload stops before publication | Unreferenced blobs may remain; no partial file batch is published |
 | Reply lost after acceptance | Retry the same transaction ID; one logical effect |
 | A dependency is unavailable | The new transaction is not accepted |
-| One journal is unavailable | Full sync fails explicitly; it does not produce a falsely complete view |
+| Up to R−1 journals are unavailable | Sync uses surviving copies and preserves missing members' cursors |
+| R or more journals are unavailable | Sync fails explicitly rather than claiming completeness |
 | A gateway stops | Another identically configured gateway can serve the same project |
-| A storage node is permanently lost | Single-copy data needs backup recovery; replication is future work |
+| A storage node is permanently lost | Surviving replicas serve the data within the fault budget; repair restores placement |
 
 Normal local commits, inspection, and recovery still work while the remote is unavailable. A push sends durable local transactions, so a failed transfer does not alter their contents.
 
@@ -111,9 +112,7 @@ Clients verify object hashes and transaction dependencies when reading. Project-
 
 ## Next scaling steps
 
-- Replicate each immutable object and journal before acknowledging a stronger durability profile.
 - Page the cached file frontier and membership sets to reduce current-map processing costs.
-- Extend bounded compressed object batches with chunked large files and regional caches. Current public batches amortize client round trips; some gateway-to-storage reads still fetch individual objects with bounded concurrency.
-- Implement explicit node evacuation and background placement repair.
-- Pin conflict-free release views and bind CI results to those exact views.
+- Add regional caches; some gateway-to-storage reads still fetch individual objects with bounded concurrency.
+- Bind CI results and protected integration policy to immutable release pins.
 - Measure one-project throughput, cost, and tail latency against tuned Git and mature alternatives.

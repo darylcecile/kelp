@@ -20,12 +20,21 @@ struct Args {
     /// Fixed storage-node URLs; omit for a single-node remote.
     #[arg(long, env = "KELP_SHARDS", value_delimiter = ',')]
     shards: Vec<String>,
+    /// Durable copies per object/journal entry in a distributed deployment.
+    #[arg(long, env = "KELP_REPLICAS", default_value_t = 2)]
+    replicas: usize,
     /// Gateway credential for the private storage nodes.
     #[arg(long, env = "KELP_STORAGE_TOKEN", hide_env_values = true)]
     storage_token: Option<String>,
     /// Compact a stopped storage node or standalone database, then exit.
     #[arg(long, conflicts_with = "shards")]
     compact: bool,
+    /// Restore replica placement across the configured storage nodes, then exit.
+    #[arg(long, conflicts_with_all = ["compact", "storage_only", "evacuate"])]
+    repair: bool,
+    /// Drain and evacuate this storage URL from --shards, then exit.
+    #[arg(long, conflicts_with_all = ["compact", "storage_only"])]
+    evacuate: Option<String>,
 }
 
 #[tokio::main]
@@ -37,6 +46,18 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    if args.repair || args.evacuate.is_some() {
+        let report = kelp_remote::maintenance::maintain(
+            args.shards,
+            args.storage_token
+                .ok_or_else(|| anyhow::anyhow!("set KELP_STORAGE_TOKEN"))?,
+            args.replicas,
+            args.evacuate,
+        )
+        .await?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
     if args.compact {
         let path = args.data_dir.join("kelp.sqlite3");
         anyhow::ensure!(path.is_file(), "no storage database at {}", path.display());
@@ -50,11 +71,12 @@ async fn main() -> anyhow::Result<()> {
     } else if args.shards.is_empty() {
         kelp_remote::app(&args.data_dir, args.token)?
     } else {
-        kelp_remote::cluster_app(
+        kelp_remote::replicated_app(
             args.shards,
             args.token,
             args.storage_token
                 .ok_or_else(|| anyhow::anyhow!("set KELP_STORAGE_TOKEN for the storage nodes"))?,
+            args.replicas,
         )?
     };
     let listener = tokio::net::TcpListener::bind(args.listen).await?;

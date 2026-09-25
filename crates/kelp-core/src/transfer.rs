@@ -59,6 +59,12 @@ impl Request {
 pub struct Info {
     pub object: Key,
     pub size: Option<u64>,
+    #[serde(default = "one_copy")]
+    pub copies: usize,
+}
+
+fn one_copy() -> usize {
+    1
 }
 
 #[derive(Debug, Clone)]

@@ -3,8 +3,9 @@
 mod backend;
 mod database;
 mod graph_api;
+pub mod maintenance;
 
-pub use graph_api::{cluster_app, storage_app};
+pub use graph_api::{cluster_app, replicated_app, storage_app};
 
 use std::{
     path::Path,

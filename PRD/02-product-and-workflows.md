@@ -81,9 +81,9 @@ kelp push
 
 The resolution commit names both file parents, so replicas agree that both alternatives were considered. It is not a timestamp-based overwrite. `show COMMIT_ID` can still inspect either original edit afterward.
 
-The prototype's choices are whole-file choices. Several different incoming alternatives may require keeping the local file, editing it manually, and committing the result. Richer per-file/text resolution is future work.
+Pull performs three-way text merging using the common path ancestor, including independent unfinished edits. It leaves original transactions and conflict parents intact until the user commits the result. Overlapping or binary conflicts retain the explicit whole-file choices above.
 
-A clean clone of a conflicted shared view currently stops with an explanation. An existing contributor must resolve and push before a clean clone is available. This is an explicit consequence of accepting conflicting contributions without a globally serialized clean-head gate.
+A clone can materialize non-overlapping text alternatives. Overlapping selected conflicts still require an existing contributor's resolution; the client does not invent a winner or publish a merge automatically.
 
 ## Partial checkouts
 
@@ -96,11 +96,11 @@ kelp push
 
 The clone persists a canonical set of project-relative files/directory prefixes. Prefix matching respects path boundaries: `services/api` does not select `services/api-old`. Commas and repeated `--paths` arguments combine selections; redundant child prefixes are collapsed. `--paths .` means a full clone.
 
-Complete transaction bodies and dependency metadata are retained. Only selected paths' historical file blobs are fetched. A commit computes edits from the selected file frontier; absent outside files do not become deletions. Pull retains the selection, including when a new remote commit changes selected and unselected paths atomically. Source conflicts entirely outside the selection do not block work; structural collisions affecting selected paths are still reported.
+Indexed journals select relevant transactions; their complete bodies and dependency closure are retained. Only selected paths' historical file blobs and transaction provenance are fetched. A commit computes edits from the selected file frontier; absent outside files do not become deletions. Cross-directory transactions remain atomic. Outside conflicts do not block work; structural collisions affecting selected paths are still reported.
 
-Saved partial views include their path scope in their hash. Restore requires a matching scope and leaves outside files untouched. Inspection of a cross-directory commit marks excluded file bodies as not downloaded rather than omitting their metadata. A partial checkout can push its new commits to the original remote, which already holds their complete dependencies. Exporting those dependencies elsewhere can require uncached outside blobs and fails explicitly when they are missing.
+Saved partial views include their path scope in their hash. Restore requires that scope to be included in the current checkout and leaves other paths untouched. Inspection marks excluded file bodies as not downloaded. A partial checkout can push new commits to its original remote. Exporting dependency history elsewhere requires the referenced contents, which can be fetched by expansion first.
 
-The selection is fixed for this release. Include root ignore/build configuration explicitly when needed. This is selective content replication, not metadata secrecy or a full project backup.
+`pull --paths DIR` expands the persisted selection; `pull --paths .` fetches the full project. Expansion preserves drafts and uses normal conflict handling for existing files. Older scoped recovery views remain usable afterward. Include root ignore/build configuration explicitly when needed.
 
 ## Understand saved views versus shared commits
 
@@ -108,7 +108,7 @@ The selection is fixed for this release. Include root ignore/build configuration
 
 `log --commits` lists the shared edit transactions in a dependency-respecting display order. Independent transactions have no intrinsic order relative to each other. Their hashes are stable references; `show` accepts a full or unambiguous prefix.
 
-Cloning creates one local saved view of the downloaded set and retains the complete transaction history separately. It does not invent a project-wide historical position for every independent commit.
+Cloning creates one local saved view of the downloaded set and retains its transaction dependency closure separately. It does not invent a project-wide historical position for every independent commit.
 
 ## Restore in place
 
@@ -151,4 +151,4 @@ Hash prefixes must contain at least four lowercase hexadecimal characters and re
 | Capacity can grow | A fourth member accepts new work while old IDs remain readable |
 | Familiar basic interface | No manually created transaction IDs, background services, or staging state |
 
-Branches, review workflows, selected-path replication, native bundles, and Git import remain advanced work. They must build on this transaction model rather than force everyday edits through a single project-wide acceptance head.
+`import SOURCE [DEST] --ref REVISION` converts selected Git ancestry, merge results, modes, and reachable tags into transactions and pinned views. Original commit bytes remain provenance; source working files are untouched. `tag NAME [VIEW]` pins a complete committed saved view and shares it through push. Branch/review policy and native bundles can build on this model without imposing a project-wide write head.

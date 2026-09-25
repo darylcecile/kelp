@@ -17,8 +17,10 @@ use reqwest::{
 };
 
 use crate::index::Projection;
+use crate::merge;
 use crate::selection;
-use crate::workspace::{Resolution, Workspace, merge_snapshots};
+use crate::workspace::{Resolution, Workspace};
+use kelp_core::{EntryKind, FileEntry, content};
 
 pub struct Remote {
     client: Client,
@@ -194,11 +196,14 @@ impl Remote {
         Ok(())
     }
 
-    fn upload(&self, workspace: &Workspace, keys: &[Key]) -> Result<()> {
+    fn upload(&self, workspace: &Workspace, keys: &[Key], replicas: usize) -> Result<()> {
         let infos = self.info(keys)?;
         let mut objects = Vec::new();
         let mut total = 4;
-        for info in infos.into_iter().filter(|info| info.size.is_none()) {
+        for info in infos
+            .into_iter()
+            .filter(|info| info.size.is_none() || info.copies < replicas)
+        {
             let bytes = storage::get(
                 &workspace.db,
                 &workspace.state.project,
@@ -235,7 +240,8 @@ impl Remote {
 
     /// Transfer the immutable outbox, never the working directory.
     pub fn push(&self, workspace: &mut Workspace) -> Result<usize> {
-        if workspace.state.outbox.is_empty() {
+        let pins = workspace.pins()?;
+        if workspace.state.outbox.is_empty() && pins.is_empty() {
             return Ok(0);
         }
         let project = self.project(workspace.state.layout.is_none())?;
@@ -246,6 +252,9 @@ impl Remote {
         workspace.save_state()?;
         let mut missing = Graph::default();
         let mut todo = workspace.state.outbox.clone();
+        for pin in &pins {
+            todo.extend(pin.roots.iter().cloned());
+        }
         let mut known = BTreeSet::new();
         let count = workspace.state.outbox.len();
         while !todo.is_empty() {
@@ -259,7 +268,7 @@ impl Remote {
                 .collect();
             for info in self.info(&keys)? {
                 let id = info.object.id;
-                if info.size.is_some() {
+                if info.size.is_some() && info.copies >= project.replicas {
                     known.insert(id);
                     continue;
                 }
@@ -276,14 +285,27 @@ impl Remote {
         let blobs: BTreeSet<_> = missing
             .transactions
             .values()
-            .flat_map(|transaction| transaction.edits.values())
-            .filter_map(|edit| edit.value.as_ref())
-            .map(|value| Key {
+            .flat_map(|transaction| {
+                transaction
+                    .edits
+                    .values()
+                    .filter_map(|edit| edit.value.as_ref())
+                    .chain(transaction.provenance.as_ref())
+            })
+            .map(|value| content::objects(&workspace.db, &workspace.state.project, value))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .map(|id| Key {
                 kind: "blob".into(),
-                id: value.blob.clone(),
+                id,
             })
             .collect();
-        self.upload(workspace, &blobs.into_iter().collect::<Vec<_>>())?;
+        self.upload(
+            workspace,
+            &blobs.into_iter().collect::<Vec<_>>(),
+            project.replicas,
+        )?;
         for id in &known {
             workspace.acknowledge(id)?;
         }
@@ -302,7 +324,14 @@ impl Remote {
             );
             workspace.acknowledge(&id)?;
         }
-        Ok(count)
+        for pin in &pins {
+            self.send(
+                self.client
+                    .post(format!("{}/pins", self.project_url))
+                    .json(pin),
+            )?;
+        }
+        Ok(count + pins.len())
     }
 
     fn fetch(
@@ -318,12 +347,13 @@ impl Remote {
         let mut graph = Graph::default();
         let mut seen = BTreeSet::new();
         loop {
-            let page: SyncPage = self
-                .send(
-                    self.client
-                        .post(format!("{}/sync", self.project_url))
-                        .json(&SyncRequest { cursors }),
-                )?
+            let page: SyncPage =
+                self.send(self.client.post(format!("{}/sync", self.project_url)).json(
+                    &SyncRequest {
+                        cursors,
+                        paths: workspace.state.paths.clone(),
+                    },
+                ))?
                 .json()?;
             let mut todo = page.transactions;
             while !todo.is_empty() {
@@ -348,7 +378,7 @@ impl Remote {
                     }
                 }
                 self.download(workspace, &keys)?;
-                let mut blobs = BTreeSet::new();
+                let mut files = Vec::new();
                 for id in ids {
                     if workspace.state.transactions.contains(&id) {
                         continue;
@@ -357,49 +387,102 @@ impl Remote {
                     transaction.validate()?;
                     ensure!(transaction.id()? == id, "noncanonical transaction");
                     todo.extend(transaction.dependencies().difference(&seen).cloned());
+                    files.extend(transaction.provenance.iter().cloned());
                     for value in transaction
                         .edits
                         .iter()
                         .filter(|(path, _)| workspace.includes(path))
                         .filter_map(|(_, edit)| edit.value.as_ref())
                     {
-                        if !storage::contains(
-                            &workspace.db,
-                            &workspace.state.project,
-                            "blob",
-                            &value.blob,
-                        )? {
-                            blobs.insert(Key {
-                                kind: "blob".into(),
-                                id: value.blob.clone(),
-                            });
-                        }
+                        files.push(value.clone());
                     }
                     graph.transactions.insert(id, transaction);
                 }
-                self.download(workspace, &blobs.into_iter().collect::<Vec<_>>())?;
+                self.download_files(workspace, files)?;
             }
             cursors = page.cursors;
             if !page.more {
                 break;
             }
         }
-        for transaction in graph.transactions.values() {
-            for entry in transaction
-                .edits
-                .iter()
-                .filter(|(path, _)| workspace.includes(path))
-                .filter_map(|(_, edit)| edit.value.as_ref())
-            {
-                ensure!(
-                    storage::size(&workspace.db, &workspace.state.project, "blob", &entry.blob)?
-                        == Some(entry.size),
-                    "remote file length mismatch"
-                );
-            }
-        }
         let projection = workspace.extend_projection(&graph)?;
         Ok((graph, projection, cursors, seen))
+    }
+
+    fn download_files(&self, workspace: &Workspace, mut files: Vec<FileEntry>) -> Result<()> {
+        let mut seen = BTreeSet::new();
+        while !files.is_empty() {
+            let pending: Vec<_> = std::mem::take(&mut files)
+                .into_iter()
+                .filter(|entry| seen.insert((entry.blob.clone(), entry.size, entry.kind)))
+                .collect();
+            let mut keys = BTreeSet::new();
+            for entry in &pending {
+                entry.validate()?;
+                if !storage::contains(&workspace.db, &workspace.state.project, "blob", &entry.blob)?
+                {
+                    keys.insert(Key {
+                        kind: "blob".into(),
+                        id: entry.blob.clone(),
+                    });
+                }
+            }
+            self.download(workspace, &keys.into_iter().collect::<Vec<_>>())?;
+            for entry in pending {
+                if entry.kind == EntryKind::Chunked {
+                    files.extend(content::children(
+                        &entry,
+                        &storage::get(
+                            &workspace.db,
+                            &workspace.state.project,
+                            "blob",
+                            &entry.blob,
+                        )?,
+                    )?);
+                } else {
+                    ensure!(
+                        storage::size(
+                            &workspace.db,
+                            &workspace.state.project,
+                            "blob",
+                            &entry.blob
+                        )? == Some(entry.size),
+                        "remote file length mismatch"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn fetch_pins(&self, workspace: &Workspace) -> Result<()> {
+        if !workspace.state.paths.is_empty() {
+            return Ok(());
+        }
+        let mut after = String::new();
+        loop {
+            let reply = self
+                .client
+                .get(format!("{}/pins", self.project_url))
+                .query(&[("after", &after)])
+                .bearer_auth(&self.token)
+                .send()?;
+            if reply.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(());
+            }
+            let pins: Vec<kelp_core::transactions::Pin> = reply.error_for_status()?.json()?;
+            if pins.is_empty() {
+                return Ok(());
+            }
+            for pin in pins {
+                ensure!(
+                    workspace.graph_from_roots(&pin.roots)?.view()?.snapshot()? == pin.snapshot,
+                    "remote tag does not match its committed roots"
+                );
+                after = pin.id()?;
+                workspace.remember_pin(&pin)?;
+            }
+        }
     }
 
     pub fn clone_project(
@@ -437,7 +520,8 @@ impl Remote {
             workspace.state.version = 2;
         }
         let (graph, projection, cursors, _) = self.fetch(&workspace, &project)?;
-        let snapshot = workspace.checkout_view(&projection.view)?.snapshot().context("the selected paths contain conflicting commits; an existing contributor must resolve them with pull, commit, and push before a clean clone is available")?;
+        let view = auto_merge(&workspace, &projection.view, &graph)?;
+        let snapshot = workspace.checkout_view(&view)?.snapshot().context("the selected paths contain overlapping conflicts; resolve them in an existing checkout before cloning these paths")?;
         workspace.apply_snapshot(&Snapshot::default(), &snapshot)?;
         workspace.state.transactions = graph.transactions.keys().cloned().collect();
         workspace.cache_projection(&projection)?;
@@ -451,30 +535,82 @@ impl Remote {
             workspace.state.base_snapshot.clone(),
             Some(&format!("Cloned {project_name}")),
         )?;
+        self.fetch_pins(&workspace)?;
         drop(workspace);
         std::fs::rename(checkout, destination)?;
         Workspace::open(destination)
     }
 
     pub fn pull(&self, workspace: &mut Workspace, resolution: Resolution) -> Result<bool> {
+        self.pull_paths(workspace, resolution, Vec::new())
+    }
+
+    pub fn pull_paths(
+        &self,
+        workspace: &mut Workspace,
+        resolution: Resolution,
+        paths: Vec<String>,
+    ) -> Result<bool> {
+        let previous_state = workspace.state.clone();
+        let previous = workspace.state.paths.clone();
+        let requested = !paths.is_empty();
+        let mut selected = selection::normalize(paths)?;
+        if !previous.is_empty() && !selected.is_empty() {
+            selected.extend(previous.clone());
+            selected = selection::normalize(selected)?;
+        }
+        // No option retains the current scope; an explicit dot expands it fully.
+        let expanded = requested && !previous.is_empty() && selected != previous;
+        if expanded {
+            workspace.state.paths = selected;
+            workspace.state.cursors.clear();
+        }
+        let result = self.pull_selected(workspace, resolution, expanded);
+        if result.is_err() {
+            workspace.state = previous_state;
+            workspace.save_state()?;
+        }
+        result
+    }
+
+    fn pull_selected(
+        &self,
+        workspace: &mut Workspace,
+        resolution: Resolution,
+        expanded: bool,
+    ) -> Result<bool> {
         let project = self.project(false)?;
+        if expanded {
+            let history = workspace.graph()?;
+            let files = history
+                .transactions
+                .values()
+                .flat_map(|transaction| transaction.edits.iter())
+                .filter(|(path, _)| workspace.includes(path))
+                .filter_map(|(_, edit)| edit.value.as_ref())
+                .cloned()
+                .collect();
+            self.download_files(workspace, files)?;
+        }
         let (graph, projection, cursors, seen) = self.fetch(workspace, &project)?;
-        if graph.transactions.is_empty() {
+        if graph.transactions.is_empty() && !expanded {
             workspace.state.outbox = workspace.state.outbox.difference(&seen).cloned().collect();
             workspace.state.cursors = cursors;
             workspace.state.layout = Some(project.layout);
             workspace.save_state()?;
+            self.fetch_pins(workspace)?;
             return Ok(false);
         }
         let base = workspace.baseline()?;
+        let view = auto_merge(workspace, &projection.view, &graph)?;
         let incoming = select_snapshot(
-            &workspace.checkout_view(&projection.view)?,
+            &workspace.checkout_view(&view)?,
             &workspace.state.transactions,
             &base,
             resolution,
         )?;
         let current = workspace.current_snapshot()?;
-        let merged = merge_snapshots(&base, &current, &incoming, resolution)?;
+        let merged = merge::working(workspace, &base, &current, &incoming, resolution)?;
         let backup = workspace.capture(Some("Before pulling commits"))?;
         ensure!(
             workspace.checkpoint_snapshot(backup.id)? == current,
@@ -498,8 +634,38 @@ impl Remote {
         workspace.state.layout = Some(project.layout);
         workspace.save_state()?;
         workspace.capture(Some("Pulled commits"))?;
+        self.fetch_pins(workspace)?;
         Ok(true)
     }
+}
+
+fn auto_merge(workspace: &Workspace, view: &View, incoming: &Graph) -> Result<View> {
+    let conflicts: Vec<_> = view
+        .conflicts()
+        .into_iter()
+        .filter(|path| workspace.includes(path))
+        .collect();
+    let mut resolved = view.clone();
+    if conflicts.is_empty() {
+        return Ok(resolved);
+    }
+    let mut graph = workspace.graph()?;
+    graph.transactions.extend(incoming.transactions.clone());
+    for path in conflicts {
+        let heads = &view.files[&path];
+        if heads.len() > 1
+            && let Some(entry) = merge::heads(workspace, &graph, &path, heads)?
+        {
+            resolved.files.insert(
+                path,
+                heads
+                    .keys()
+                    .map(|id| (id.clone(), Some(entry.clone())))
+                    .collect(),
+            );
+        }
+    }
+    Ok(resolved)
 }
 
 fn select_snapshot(

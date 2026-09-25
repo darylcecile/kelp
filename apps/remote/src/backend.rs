@@ -6,7 +6,7 @@ use std::{
 
 use kelp_core::{
     object_id, storage,
-    transactions::{JournalPage, SyncPage, Transaction, partition},
+    transactions::{JournalPage, Pin, SyncPage, SyncRequest, Transaction, partition},
     transfer::{self, Info, Key, Object},
 };
 use rusqlite::{Connection, params};
@@ -20,7 +20,20 @@ pub enum Backend {
         nodes: Arc<Vec<String>>,
         token: Arc<str>,
         client: reqwest::Client,
+        replicas: usize,
     },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredObject {
+    pub project: String,
+    pub key: Key,
+}
+
+impl StoredObject {
+    pub fn cursor(&self) -> String {
+        format!("{}\0{}\0{}", self.project, self.key.kind, self.key.id)
+    }
 }
 
 impl Backend {
@@ -33,7 +46,11 @@ impl Backend {
                     keys.into_iter()
                         .map(|key| {
                             let size = storage::size(db, &project, &key.kind, &key.id)?;
-                            Ok(Info { object: key, size })
+                            Ok(Info {
+                                object: key,
+                                size,
+                                copies: usize::from(size.is_some()),
+                            })
                         })
                         .collect()
                 })
@@ -43,6 +60,7 @@ impl Backend {
                 nodes,
                 token,
                 client,
+                ..
             } => {
                 let mut calls = tokio::task::JoinSet::new();
                 for node in nodes.iter() {
@@ -61,17 +79,33 @@ impl Backend {
                     });
                 }
                 let mut sizes = std::collections::BTreeMap::new();
+                let mut failures = 0;
                 while let Some(reply) = calls.join_next().await {
-                    for info in reply.map_err(|error| Error::Internal(error.into()))?? {
+                    let reply = reply.map_err(|error| Error::Internal(error.into()))?;
+                    let Ok(infos) = reply else {
+                        failures += 1;
+                        continue;
+                    };
+                    for info in infos {
                         if let Some(size) = info.size {
-                            sizes.insert(info.object, size);
+                            let entry = sizes.entry(info.object).or_insert((size, 0));
+                            if entry.0 != size {
+                                return Err(Error::Unavailable("replica size mismatch".into()));
+                            }
+                            entry.1 += 1;
                         }
                     }
+                }
+                if failures >= self.replicas() {
+                    return Err(Error::Unavailable(
+                        "not enough storage replicas are reachable".into(),
+                    ));
                 }
                 Ok(keys
                     .into_iter()
                     .map(|key| Info {
-                        size: sizes.get(&key).copied(),
+                        size: sizes.get(&key).map(|entry| entry.0),
+                        copies: sizes.get(&key).map_or(0, |entry| entry.1),
                         object: key,
                     })
                     .collect())
@@ -121,6 +155,7 @@ impl Backend {
                 let project = project.to_owned();
                 self.local_run(move |db| {
                     require_project(db, &project)?;
+                    require_writable(db)?;
                     let transaction = db.transaction().map_err(anyhow::Error::from)?;
                     for object in objects {
                         storage::put(&transaction, &project, "blob", &object.bytes)?;
@@ -134,27 +169,50 @@ impl Backend {
                 nodes,
                 token,
                 client,
+                ..
             } => {
-                let mut groups: std::collections::BTreeMap<usize, Vec<Object>> = Default::default();
-                for object in objects {
-                    groups
-                        .entry(partition(project, "blob", &object.key.id, nodes.len()))
-                        .or_default()
-                        .push(object);
+                let mut copies = std::collections::BTreeMap::<String, usize>::new();
+                for offset in 0..nodes.len() {
+                    let mut groups: std::collections::BTreeMap<usize, Vec<Object>> =
+                        Default::default();
+                    for object in &objects {
+                        if copies.get(&object.key.id).copied().unwrap_or(0) < self.replicas() {
+                            let owner = (partition(project, "blob", &object.key.id, nodes.len())
+                                + offset)
+                                % nodes.len();
+                            groups.entry(owner).or_default().push(object.clone());
+                        }
+                    }
+                    if groups.is_empty() {
+                        break;
+                    }
+                    let mut tasks = tokio::task::JoinSet::new();
+                    for (owner, objects) in groups {
+                        let request = client
+                            .post(format!(
+                                "{}/storage/projects/{project}/objects/upload",
+                                nodes[owner]
+                            ))
+                            .bearer_auth(token.as_ref())
+                            .body(transfer::encode(&objects)?);
+                        tasks.spawn(async move { (objects, response(request).await.is_ok()) });
+                    }
+                    while let Some(result) = tasks.join_next().await {
+                        let (objects, success) =
+                            result.map_err(|error| Error::Internal(error.into()))?;
+                        if success {
+                            for object in objects {
+                                *copies.entry(object.key.id).or_default() += 1;
+                            }
+                        }
+                    }
                 }
-                let mut tasks = tokio::task::JoinSet::new();
-                for (owner, objects) in groups {
-                    let request = client
-                        .post(format!(
-                            "{}/storage/projects/{project}/objects/upload",
-                            nodes[owner]
-                        ))
-                        .bearer_auth(token.as_ref())
-                        .body(transfer::encode(&objects)?);
-                    tasks.spawn(async move { response(request).await.map(|_| ()) });
-                }
-                while let Some(result) = tasks.join_next().await {
-                    result.map_err(|error| Error::Internal(error.into()))??;
+                if objects.iter().any(|object| {
+                    copies.get(&object.key.id).copied().unwrap_or(0) < self.replicas()
+                }) {
+                    return Err(Error::Unavailable(
+                        "could not durably replicate every object".into(),
+                    ));
                 }
                 Ok(())
             }
@@ -163,6 +221,11 @@ impl Backend {
     pub fn local(directory: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(directory)?;
         let db = storage::open(&directory.join("kelp.sqlite3"))?;
+        let indexed: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='tx_paths')",
+            [],
+            |row| row.get(0),
+        )?;
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS tx_projects (name TEXT PRIMARY KEY);
              CREATE TABLE IF NOT EXISTS tx_journal (
@@ -171,12 +234,41 @@ impl Backend {
                 transaction_id TEXT NOT NULL,
                 UNIQUE(project, transaction_id)
              );
-             CREATE INDEX IF NOT EXISTS tx_journal_project_cursor ON tx_journal(project, sequence);",
+             CREATE INDEX IF NOT EXISTS tx_journal_project_cursor ON tx_journal(project, sequence);
+             CREATE TABLE IF NOT EXISTS tx_settings (key TEXT PRIMARY KEY, value INTEGER NOT NULL);",
         )?;
+        let tx = db.unchecked_transaction()?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS tx_paths (project TEXT NOT NULL, path TEXT NOT NULL, transaction_id TEXT NOT NULL, PRIMARY KEY(project,path,transaction_id));")?;
+        if !indexed {
+            let rows = tx
+                .prepare("SELECT project,transaction_id FROM tx_journal")?
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (project, id) in rows {
+                let transaction: Transaction =
+                    storage::get_json(&tx, &project, "transaction", &id)?;
+                index_paths(&tx, &project, &id, &transaction)?;
+            }
+        }
+        tx.commit()?;
         Ok(Self::Local(Arc::new(Mutex::new(db))))
     }
 
-    pub fn cluster(mut nodes: Vec<String>, token: String) -> anyhow::Result<Self> {
+    pub fn cluster(nodes: Vec<String>, token: String) -> anyhow::Result<Self> {
+        Self::replicated_cluster(nodes, token, 1)
+    }
+
+    pub fn replicated_cluster(
+        mut nodes: Vec<String>,
+        token: String,
+        replicas: usize,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            replicas > 0 && replicas <= nodes.len(),
+            "replica count must be between 1 and the number of storage nodes"
+        );
         anyhow::ensure!(
             !nodes.is_empty() && !token.is_empty(),
             "storage nodes and a storage token are required"
@@ -204,6 +296,7 @@ impl Backend {
         Ok(Self::Cluster {
             nodes: Arc::new(nodes),
             token: token.into(),
+            replicas,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .redirect(reqwest::redirect::Policy::none())
@@ -218,10 +311,134 @@ impl Backend {
         }
     }
 
+    pub fn replicas(&self) -> usize {
+        match self {
+            Self::Local(_) => 1,
+            Self::Cluster { replicas, .. } => *replicas,
+        }
+    }
+
+    pub async fn drain(&self) -> Result<(), Error> {
+        self.local_run(|db| {
+            db.execute(
+                "INSERT OR REPLACE INTO tx_settings VALUES('draining',1)",
+                [],
+            )
+            .map_err(anyhow::Error::from)?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn inventory(&self, after: String) -> Result<Vec<StoredObject>, Error> {
+        self.local_run(move |db| {
+            Ok(db.prepare("SELECT n.name,k.name,lower(hex(o.hash)) FROM object_index o JOIN storage_namespaces n ON n.id=o.namespace JOIN storage_kinds k ON k.id=o.kind WHERE k.name IN ('blob','transaction','pin') AND n.name||char(0)||k.name||char(0)||lower(hex(o.hash))>?1 ORDER BY n.name,k.name,o.hash LIMIT 128")
+                .map_err(anyhow::Error::from)?.query_map([after], |row| Ok(StoredObject { project: row.get(0)?, key: Key { kind: row.get(1)?, id: row.get(2)? } })).map_err(anyhow::Error::from)?.collect::<Result<Vec<_>, _>>().map_err(anyhow::Error::from)?)
+        }).await
+    }
+
+    pub async fn pins(&self, project: &str, after: &str) -> Result<Vec<Pin>, Error> {
+        let mut pins = std::collections::BTreeMap::new();
+        match self {
+            Self::Local(_) => {
+                let (project, after) = (project.to_owned(), after.to_owned());
+                return self
+                    .local_run(move |db| {
+                        storage::ids(db, &project, "pin")?
+                            .into_iter()
+                            .filter(|id| id > &after)
+                            .take(128)
+                            .map(|id| Ok(storage::get_json(db, &project, "pin", &id)?))
+                            .collect()
+                    })
+                    .await;
+            }
+            Self::Cluster {
+                nodes,
+                client,
+                token,
+                ..
+            } => {
+                let mut failures = 0;
+                for node in nodes.iter() {
+                    let reply = response(
+                        client
+                            .get(format!("{node}/storage/projects/{project}/pins"))
+                            .query(&[("after", after)])
+                            .bearer_auth(token.as_ref()),
+                    )
+                    .await;
+                    let Ok(reply) = reply else {
+                        failures += 1;
+                        continue;
+                    };
+                    for pin in reply.json::<Vec<Pin>>().await.map_err(unavailable)? {
+                        pins.insert(pin.id()?, pin);
+                    }
+                }
+                if failures >= self.replicas() {
+                    return Err(Error::Unavailable(
+                        "not enough replicas to list release views".into(),
+                    ));
+                }
+            }
+        }
+        Ok(pins.into_values().take(128).collect())
+    }
+
+    pub async fn put_pin(&self, project: &str, pin: Pin) -> Result<(), Error> {
+        match self {
+            Self::Local(_) => {
+                let project = project.to_owned();
+                self.local_run(move |db| {
+                    require_writable(db)?;
+                    require_project(db, &project)?;
+                    storage::put_json(db, &project, "pin", &pin)?;
+                    Ok(())
+                })
+                .await
+            }
+            Self::Cluster {
+                nodes,
+                client,
+                token,
+                ..
+            } => {
+                let owner = partition(project, "pin", &pin.id()?, nodes.len());
+                let mut copies = 0;
+                for offset in 0..nodes.len() {
+                    let node = &nodes[(owner + offset) % nodes.len()];
+                    if response(
+                        client
+                            .post(format!("{node}/storage/projects/{project}/pins"))
+                            .bearer_auth(token.as_ref())
+                            .json(&pin),
+                    )
+                    .await
+                    .is_ok()
+                    {
+                        copies += 1;
+                        if copies == self.replicas() {
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(Error::Unavailable(
+                    "could not durably replicate release view".into(),
+                ))
+            }
+        }
+    }
+
     pub fn layout(&self) -> String {
         match self {
             Self::Local(_) => "local".into(),
-            Self::Cluster { nodes, .. } => object_id("layout", nodes.join("\0").as_bytes()),
+            Self::Cluster {
+                nodes, replicas, ..
+            } => object_id(
+                "layout",
+                format!("{}\0{replicas}", nodes.join("\0")).as_bytes(),
+            ),
         }
     }
 
@@ -251,6 +468,7 @@ impl Backend {
             Self::Local(_) => {
                 self.local_run(move |db| {
                     if create {
+                        require_writable(db)?;
                         db.execute(
                             "INSERT OR IGNORE INTO tx_projects(name) VALUES (?1)",
                             [&name],
@@ -265,6 +483,7 @@ impl Backend {
                 nodes,
                 token,
                 client,
+                ..
             } => {
                 let mut calls = tokio::task::JoinSet::new();
                 for node in nodes.iter() {
@@ -285,14 +504,20 @@ impl Backend {
                     });
                 }
                 let mut found = false;
+                let mut failures = 0;
                 let mut missing = Vec::new();
                 while let Some(result) = calls.join_next().await {
                     let (node, result) = result.map_err(|error| Error::Internal(error.into()))?;
                     match result {
                         Ok(()) => found = true,
                         Err(Error::Missing(_)) if !create => missing.push(node),
-                        Err(error) => return Err(error),
+                        Err(_) => failures += 1,
                     }
+                }
+                if failures >= self.replicas() {
+                    return Err(Error::Unavailable(
+                        "not enough project replicas are reachable".into(),
+                    ));
                 }
                 if !found {
                     return Err(Error::Missing(format!("project {project} does not exist")));
@@ -327,6 +552,7 @@ impl Backend {
                 nodes,
                 token,
                 client,
+                ..
             } => {
                 let bytes = locate(nodes, client, token, project, kind, id, false)
                     .await?
@@ -357,6 +583,7 @@ impl Backend {
                 nodes,
                 token,
                 client,
+                ..
             } => {
                 let reply = locate(nodes, client, token, project, kind, id, true).await?;
                 reply
@@ -370,34 +597,17 @@ impl Backend {
     }
 
     pub async fn put_blob(&self, project: &str, id: &str, bytes: Vec<u8>) -> Result<(), Error> {
-        match self {
-            Self::Local(_) => {
-                let project = project.to_owned();
-                self.local_run(move |db| {
-                    require_project(db, &project)?;
-                    storage::put(db, &project, "blob", &bytes)?;
-                    Ok(())
-                })
-                .await
-            }
-            Self::Cluster {
-                nodes,
-                token,
-                client,
-            } => {
-                let node = &nodes[partition(project, "blob", id, nodes.len())];
-                response(
-                    client
-                        .put(format!(
-                            "{node}/storage/projects/{project}/objects/blob/{id}"
-                        ))
-                        .bearer_auth(token.as_ref())
-                        .body(bytes),
-                )
-                .await?;
-                Ok(())
-            }
-        }
+        self.put_batch(
+            project,
+            vec![Object {
+                key: Key {
+                    kind: "blob".into(),
+                    id: id.into(),
+                },
+                bytes,
+            }],
+        )
+        .await
     }
 
     /// The gateway verifies dependencies and blob closure before this operation.
@@ -410,7 +620,9 @@ impl Backend {
                 self.local_run(move |db| {
                     require_project(db, &project)?;
                     let tx = db.transaction().map_err(anyhow::Error::from)?;
+                    require_writable(&tx)?;
                     let id = storage::put_json(&tx, &project, "transaction", &transaction)?;
+                    index_paths(&tx, &project, &id, &transaction)?;
                     tx.execute(
                         "INSERT OR IGNORE INTO tx_journal(project, transaction_id) VALUES (?1, ?2)",
                         params![project, id],
@@ -425,35 +637,70 @@ impl Backend {
                 nodes,
                 token,
                 client,
+                ..
             } => {
-                let node = &nodes[partition(project, "transaction", &id, nodes.len())];
-                let receipt: kelp_core::transactions::Receipt = response(
-                    client
-                        .post(format!("{node}/storage/projects/{project}/transactions"))
-                        .bearer_auth(token.as_ref())
-                        .json(&transaction),
-                )
-                .await?
-                .json()
-                .await
-                .map_err(unavailable)?;
-                if receipt.transaction != id {
-                    return Err(Error::Unavailable("storage receipt mismatch".into()));
+                let owner = partition(project, "transaction", &id, nodes.len());
+                let mut copies = 0;
+                for offset in 0..nodes.len() {
+                    let node = &nodes[(owner + offset) % nodes.len()];
+                    let reply = response(
+                        client
+                            .post(format!("{node}/storage/projects/{project}/transactions"))
+                            .bearer_auth(token.as_ref())
+                            .json(&transaction),
+                    )
+                    .await;
+                    let Ok(reply) = reply else {
+                        continue;
+                    };
+                    let receipt: kelp_core::transactions::Receipt =
+                        reply.json().await.map_err(unavailable)?;
+                    if receipt.transaction != id {
+                        return Err(Error::Unavailable("storage receipt mismatch".into()));
+                    }
+                    copies += 1;
+                    if copies == self.replicas() {
+                        return Ok(id);
+                    }
                 }
-                Ok(id)
+                Err(Error::Unavailable(
+                    "could not durably replicate the transaction journal".into(),
+                ))
             }
         }
     }
 
     pub async fn journal(&self, project: &str, after: i64) -> Result<JournalPage, Error> {
+        self.journal_selected(project, after, Vec::new()).await
+    }
+
+    async fn journal_selected(
+        &self,
+        project: &str,
+        after: i64,
+        paths: Vec<String>,
+    ) -> Result<JournalPage, Error> {
         if after < 0 {
             return Err(Error::Invalid("negative journal cursor".into()));
         }
         let project = project.to_owned();
         self.local_run(move |db| {
             require_project(db, &project)?;
-            let mut statement = db.prepare("SELECT sequence, transaction_id FROM tx_journal WHERE project = ?1 AND sequence > ?2 ORDER BY sequence LIMIT 257").map_err(anyhow::Error::from)?;
-            let mut rows = statement.query_map(params![project, after], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            let mut sql = "SELECT sequence, transaction_id FROM tx_journal j WHERE project = ?1 AND sequence > ?2".to_owned();
+            let mut args: Vec<rusqlite::types::Value> = vec![project.into(), after.into()];
+            if !paths.is_empty() {
+                sql.push_str(" AND EXISTS(SELECT 1 FROM tx_paths p WHERE p.project=j.project AND p.transaction_id=j.transaction_id AND (");
+                let predicates: Vec<_> = paths.iter().enumerate().map(|(index, path)| {
+                    args.push(path.clone().into());
+                    let n = index + 3;
+                    format!("(p.path=?{n} OR (p.path>=?{n}||'/' AND p.path<?{n}||'0') OR (?{n}>=p.path||'/' AND ?{n}<p.path||'0'))")
+                }).collect();
+                sql.push_str(&predicates.join(" OR "));
+                sql.push_str("))");
+            }
+            sql.push_str(" ORDER BY sequence LIMIT 257");
+            let mut statement = db.prepare(&sql).map_err(anyhow::Error::from)?;
+            let mut rows = statement.query_map(rusqlite::params_from_iter(args), |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
                 .map_err(anyhow::Error::from)?.collect::<Result<Vec<_>, _>>().map_err(anyhow::Error::from)?;
             let more = rows.len() > 256;
             if more { rows.pop(); }
@@ -462,7 +709,12 @@ impl Backend {
         }).await
     }
 
-    pub async fn sync(&self, project: &str, cursors: Vec<i64>) -> Result<SyncPage, Error> {
+    pub async fn sync_selected(
+        &self,
+        project: &str,
+        cursors: Vec<i64>,
+        paths: Vec<String>,
+    ) -> Result<SyncPage, Error> {
         let cursors = if cursors.is_empty() {
             vec![0; self.nodes()]
         } else {
@@ -480,7 +732,7 @@ impl Backend {
         };
         match self {
             Self::Local(_) => {
-                let page = self.journal(project, cursors[0]).await?;
+                let page = self.journal_selected(project, cursors[0], paths).await?;
                 result.transactions.extend(page.transactions);
                 result.cursors[0] = page.cursor;
                 result.more = page.more;
@@ -489,29 +741,61 @@ impl Backend {
                 nodes,
                 token,
                 client,
+                ..
             } => {
                 let mut calls = tokio::task::JoinSet::new();
                 for (index, node) in nodes.iter().enumerate() {
                     let request = client
-                        .get(format!("{node}/storage/projects/{project}/journal"))
-                        .query(&[("after", cursors[index])])
+                        .post(format!("{node}/storage/projects/{project}/sync"))
+                        .json(&SyncRequest {
+                            cursors: vec![cursors[index]],
+                            paths: paths.clone(),
+                        })
                         .bearer_auth(token.as_ref());
                     calls.spawn(async move {
-                        let page: JournalPage =
+                        let page: SyncPage =
                             response(request).await?.json().await.map_err(unavailable)?;
                         Ok::<_, Error>((index, page))
                     });
                 }
+                let mut failures = 0;
                 while let Some(reply) = calls.join_next().await {
-                    let (index, page) = reply.map_err(|error| Error::Internal(error.into()))??;
+                    let reply = reply.map_err(|error| Error::Internal(error.into()))?;
+                    let Ok((index, page)) = reply else {
+                        failures += 1;
+                        continue;
+                    };
                     result.transactions.extend(page.transactions);
-                    result.cursors[index] = page.cursor;
+                    result.cursors[index] = *page
+                        .cursors
+                        .first()
+                        .ok_or_else(|| Error::Unavailable("missing storage cursor".into()))?;
                     result.more |= page.more;
+                }
+                if failures >= self.replicas() {
+                    return Err(Error::Unavailable(
+                        "not enough journal replicas are reachable for a complete sync".into(),
+                    ));
                 }
             }
         }
         Ok(result)
     }
+}
+
+fn index_paths(
+    db: &Connection,
+    project: &str,
+    id: &str,
+    transaction: &Transaction,
+) -> anyhow::Result<()> {
+    let mut insert = db.prepare_cached(
+        "INSERT OR IGNORE INTO tx_paths(project,path,transaction_id) VALUES(?1,?2,?3)",
+    )?;
+    for path in transaction.edits.keys() {
+        insert.execute(params![project, path, id])?;
+    }
+    Ok(())
 }
 
 fn require_project(db: &Connection, name: &str) -> Result<(), Error> {
@@ -527,6 +811,20 @@ fn require_project(db: &Connection, name: &str) -> Result<(), Error> {
     } else {
         Err(Error::Missing(format!("project {name} does not exist")))
     }
+}
+
+fn require_writable(db: &Connection) -> Result<(), Error> {
+    let draining: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM tx_settings WHERE key='draining' AND value=1)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(anyhow::Error::from)?;
+    if draining {
+        return Err(Error::Unavailable("storage node is draining".into()));
+    }
+    Ok(())
 }
 
 fn unavailable(error: impl std::fmt::Display) -> Error {

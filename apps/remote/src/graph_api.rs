@@ -10,8 +10,10 @@ use axum::{
     routing::{get, post},
 };
 use kelp_core::{
-    ApiError, MAX_BLOB_BYTES, MAX_METADATA_BYTES, object_id,
-    transactions::{JournalPage, PROTOCOL, Project, Receipt, SyncPage, SyncRequest, Transaction},
+    ApiError, EntryKind, MAX_BLOB_BYTES, MAX_METADATA_BYTES, content, object_id,
+    transactions::{
+        Graph, JournalPage, PROTOCOL, Pin, Project, Receipt, SyncPage, SyncRequest, Transaction,
+    },
     transfer::{self, Info},
     validate_hash, validate_name,
 };
@@ -44,6 +46,20 @@ pub fn storage_app(data: &Path, token: String) -> anyhow::Result<Router> {
     Ok(routes(Backend::local(data)?, token, true)?.route("/healthz", get(|| async { "ok\n" })))
 }
 
+pub fn replicated_app(
+    nodes: Vec<String>,
+    token: String,
+    storage_token: String,
+    replicas: usize,
+) -> anyhow::Result<Router> {
+    Ok(routes(
+        Backend::replicated_cluster(nodes, storage_token, replicas)?,
+        token,
+        false,
+    )?
+    .route("/healthz", get(|| async { "ok\n" })))
+}
+
 fn routes(backend: Backend, token: String, storage: bool) -> anyhow::Result<Router> {
     anyhow::ensure!(!token.trim().is_empty(), "access token must not be empty");
     let state = GraphState {
@@ -52,6 +68,8 @@ fn routes(backend: Backend, token: String, storage: bool) -> anyhow::Result<Rout
     };
     let router = if storage {
         Router::new()
+            .route("/storage/drain", post(drain))
+            .route("/storage/inventory", get(inventory))
             .route(
                 "/storage/projects/{project}",
                 get(project).put(create_project),
@@ -65,6 +83,11 @@ fn routes(backend: Backend, token: String, storage: bool) -> anyhow::Result<Rout
                 post(append_verified),
             )
             .route("/storage/projects/{project}/journal", get(journal))
+            .route("/storage/projects/{project}/sync", post(sync))
+            .route(
+                "/storage/projects/{project}/pins",
+                get(pins).post(pin_verified),
+            )
             .route(
                 "/storage/projects/{project}/objects/info",
                 post(object_info),
@@ -86,6 +109,7 @@ fn routes(backend: Backend, token: String, storage: bool) -> anyhow::Result<Rout
             )
             .route("/v1/projects/{project}/transactions", post(push))
             .route("/v1/projects/{project}/sync", post(sync))
+            .route("/v1/projects/{project}/pins", get(pins).post(pin))
             .route("/v1/projects/{project}/objects/info", post(object_info))
             .route(
                 "/v1/projects/{project}/objects/download",
@@ -130,6 +154,7 @@ fn info(state: &GraphState, project: String) -> Project {
         protocol: PROTOCOL.into(),
         layout: state.backend.layout(),
         storage_nodes: state.backend.nodes(),
+        replicas: state.backend.replicas(),
     }
 }
 
@@ -154,7 +179,7 @@ async fn project(
 fn validate_object(project: &str, kind: &str, id: &str) -> Result<(), Error> {
     validate_name(project).map_err(invalid)?;
     validate_hash(id).map_err(invalid)?;
-    if !matches!(kind, "blob" | "transaction") {
+    if !matches!(kind, "blob" | "transaction" | "pin") {
         return Err(invalid("unsupported object kind"));
     }
     Ok(())
@@ -216,10 +241,18 @@ async fn push(
     validate_name(&project).map_err(invalid)?;
     let transaction = transaction(&bytes)?;
     let id = transaction.id()?;
-    match state.backend.size(&project, "transaction", &id).await {
-        Ok(_) => return Ok(Json(Receipt { transaction: id })),
-        Err(Error::Missing(_)) => {}
-        Err(error) => return Err(error),
+    let existing = state
+        .backend
+        .info_batch(
+            &project,
+            vec![transfer::Key {
+                kind: "transaction".into(),
+                id: id.clone(),
+            }],
+        )
+        .await?;
+    if existing[0].copies >= state.backend.replicas() {
+        return Ok(Json(Receipt { transaction: id }));
     }
     let mut parents = BTreeMap::new();
     let parent_keys: Vec<_> = transaction
@@ -231,6 +264,17 @@ async fn push(
         })
         .collect();
     for chunk in parent_keys.chunks(transfer::MAX_OBJECTS) {
+        if state
+            .backend
+            .info_batch(&project, chunk.to_vec())
+            .await?
+            .iter()
+            .any(|info| info.copies < state.backend.replicas())
+        {
+            return Err(Error::Unavailable(
+                "a dependency is not durably replicated; retry its publication first".into(),
+            ));
+        }
         for object in state.backend.get_batch(&project, chunk.to_vec()).await? {
             parents.insert(
                 object.key.id,
@@ -239,27 +283,53 @@ async fn push(
         }
     }
     transaction.validate_parents(&parents).map_err(invalid)?;
-    let blob_keys: std::collections::BTreeSet<_> = transaction
+    let mut files: Vec<_> = transaction
         .edits
         .values()
         .filter_map(|edit| edit.value.as_ref())
-        .map(|value| transfer::Key {
-            kind: "blob".into(),
-            id: value.blob.clone(),
-        })
+        .chain(transaction.provenance.as_ref())
+        .cloned()
         .collect();
-    let blob_keys: Vec<_> = blob_keys.into_iter().collect();
-    let mut sizes = BTreeMap::new();
-    for chunk in blob_keys.chunks(transfer::MAX_OBJECTS) {
-        for info in state.backend.info_batch(&project, chunk.to_vec()).await? {
-            sizes.insert(info.object.id, info.size);
-        }
-    }
-    for (path, edit) in &transaction.edits {
-        if let Some(value) = &edit.value
-            && sizes.get(&value.blob) != Some(&Some(value.size))
+    let mut seen = std::collections::BTreeSet::new();
+    while !files.is_empty() {
+        let pending: Vec<_> = std::mem::take(&mut files)
+            .into_iter()
+            .filter(|entry| seen.insert((entry.blob.clone(), entry.size, entry.kind)))
+            .collect();
+        let keys: std::collections::BTreeSet<_> = pending
+            .iter()
+            .map(|entry| transfer::Key {
+                kind: "blob".into(),
+                id: entry.blob.clone(),
+            })
+            .collect();
+        let mut sizes = BTreeMap::new();
+        for chunk in keys
+            .into_iter()
+            .collect::<Vec<_>>()
+            .chunks(transfer::MAX_OBJECTS)
         {
-            return Err(invalid(format!("file size mismatch for {path}")));
+            for info in state.backend.info_batch(&project, chunk.to_vec()).await? {
+                if info.copies < state.backend.replicas() {
+                    return Err(Error::Unavailable(
+                        "file content is not durably replicated".into(),
+                    ));
+                }
+                sizes.insert(info.object.id, info.size);
+            }
+        }
+        for entry in pending {
+            if entry.kind == EntryKind::Chunked {
+                files.extend(
+                    content::children(
+                        &entry,
+                        &state.backend.get(&project, "blob", &entry.blob).await?,
+                    )
+                    .map_err(invalid)?,
+                );
+            } else if sizes.get(&entry.blob) != Some(&Some(entry.size)) {
+                return Err(invalid("file content size mismatch"));
+            }
         }
     }
     Ok(Json(Receipt {
@@ -360,5 +430,92 @@ async fn sync(
     Json(request): Json<SyncRequest>,
 ) -> Result<Json<SyncPage>, Error> {
     validate_name(&project).map_err(invalid)?;
-    Ok(Json(state.backend.sync(&project, request.cursors).await?))
+    for path in &request.paths {
+        kelp_core::validate_path(path).map_err(invalid)?;
+    }
+    Ok(Json(
+        state
+            .backend
+            .sync_selected(&project, request.cursors, request.paths)
+            .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct PinQuery {
+    #[serde(default)]
+    after: String,
+}
+
+async fn drain(State(state): State<GraphState>) -> Result<StatusCode, Error> {
+    state.backend.drain().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn inventory(
+    State(state): State<GraphState>,
+    Query(query): Query<PinQuery>,
+) -> Result<Json<Vec<crate::backend::StoredObject>>, Error> {
+    Ok(Json(state.backend.inventory(query.after).await?))
+}
+
+async fn pins(
+    State(state): State<GraphState>,
+    RoutePath(project): RoutePath<String>,
+    Query(query): Query<PinQuery>,
+) -> Result<Json<Vec<Pin>>, Error> {
+    validate_name(&project).map_err(invalid)?;
+    Ok(Json(state.backend.pins(&project, &query.after).await?))
+}
+
+async fn pin_verified(
+    State(state): State<GraphState>,
+    RoutePath(project): RoutePath<String>,
+    Json(pin): Json<Pin>,
+) -> Result<StatusCode, Error> {
+    validate_name(&project).map_err(invalid)?;
+    pin.validate().map_err(invalid)?;
+    state.backend.put_pin(&project, pin).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn pin(
+    State(state): State<GraphState>,
+    RoutePath(project): RoutePath<String>,
+    Json(pin): Json<Pin>,
+) -> Result<StatusCode, Error> {
+    validate_name(&project).map_err(invalid)?;
+    pin.validate().map_err(invalid)?;
+    let mut graph = Graph::default();
+    let mut todo: Vec<_> = pin.roots.iter().cloned().collect();
+    while let Some(id) = todo.pop() {
+        if graph.transactions.contains_key(&id) {
+            continue;
+        }
+        let info = state
+            .backend
+            .info_batch(
+                &project,
+                vec![transfer::Key {
+                    kind: "transaction".into(),
+                    id: id.clone(),
+                }],
+            )
+            .await?;
+        if info[0].copies < state.backend.replicas() {
+            return Err(Error::Unavailable(
+                "release view dependencies are not durably replicated".into(),
+            ));
+        }
+        let transaction: Transaction =
+            serde_json::from_slice(&state.backend.get(&project, "transaction", &id).await?)
+                .map_err(invalid)?;
+        todo.extend(transaction.dependencies());
+        graph.transactions.insert(id, transaction);
+    }
+    if graph.view()?.snapshot()? != pin.snapshot {
+        return Err(invalid("release view must match its committed roots"));
+    }
+    state.backend.put_pin(&project, pin).await?;
+    Ok(StatusCode::NO_CONTENT)
 }

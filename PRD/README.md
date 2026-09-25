@@ -57,7 +57,7 @@ Content and transaction records are hash-partitioned within a project. Each stor
 
 Pull unions journal entries, retrieves required ancestors, and materializes the resulting view. Journal positions are transport cursors local to a node, not a global order imposed on all work.
 
-The first distributed implementation has durable single-copy storage partitions, incremental journals, and read fallback during node additions. Replication, automated node evacuation, advanced indexes, and production throughput qualification remain separate work. Full-project discovery requires the configured nodes to be available.
+The distributed implementation has replicated object/journal placement, indexed path-scoped journals, and read/write fallback. Repair and node evacuation preserve immutable objects and release pins. With replication factor R, discovery tolerates up to R−1 unavailable members. Production throughput and regional failure-domain qualification still require measurement.
 
 ## Documents
 

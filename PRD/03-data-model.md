@@ -119,7 +119,7 @@ A saved-view object contains `format`, `snapshot`, and a sorted `roots` set. Its
 
 Full saved views retain format 1 and their existing byte encoding/hashes. A partial saved view uses format 2 and additionally records a canonical `paths` list. Its snapshot contains only those paths, while its roots preserve the complete known transaction context. It does not claim that excluded file contents are present locally or that excluded conflicts are resolved.
 
-Partial workspace metadata uses version 2 so older clients cannot mistake excluded paths for deletions. An empty selection means the complete project; otherwise every scan, commit, checkout, and restore is restricted to the selected path prefixes. The global file frontier remains complete in metadata. Only the selected frontier is compared with working files when constructing a new transaction.
+Workspace metadata uses version 3 to fence extended file/path semantics from older clients. An empty selection means the complete project; otherwise scans and commits are restricted to selected prefixes. The retained frontier covers selected transactions and their full dependency closure. Indexed sync can omit unrelated transactions entirely. Only selected paths are compared with working files when constructing a new transaction.
 
 This keeps atomic cross-directory transactions intact: their metadata is not rewritten into smaller transactions. The client may lack excluded blobs, and it must never substitute empty bytes for them. New partial commits push normally to a remote that already has their dependencies. A clone to another remote must obtain any missing outside-path dependency contents before those old transactions can be published there.
 
@@ -147,7 +147,13 @@ Remaining costs include directory/stat traversal, current-file-map serialization
 
 The transaction protocol is `kelp/1`. Transaction objects have `format: 1`, deterministic JSON field ordering, sorted paths, and sorted parent sets. File content retains the existing `kelp/0` typed-hash envelope so existing cached blob IDs remain valid. Object-format version and network-protocol version are distinct.
 
-The prototype retains regular UTF-8-path files, whole-file objects up to 16 MiB, and transaction metadata up to 2 MiB. Paged maps and large-file chunking are future optimizations.
+Regular files at most 16 MiB retain their original encoding. Larger files are streamed into 4 MiB chunks and bounded manifest trees (at most 1,024 children per manifest). Manifests and chunks use ordinary immutable blob storage, partitioning, and transfer. Child sizes sum to the parent size and strictly shrink; readers verify the complete tree. Changing one chunk reuses unaffected chunks. Symlink entries store target bytes rather than dereferenced contents.
+
+Transaction format 2 permits extended file entries and an optional provenance entry. Git import uses provenance to retain exact original Git commit bytes, including signature headers, through synchronization. Existing format-1 transaction hashes remain unchanged. Metadata per transaction remains bounded at 2 MiB.
+
+UTF-8 paths keep their existing keys. Non-UTF-8 components use a NUL-prefixed hexadecimal encoding, disjoint from literal filesystem names. Validation rejects traversal, metadata directories, embedded NUL bytes, and noncanonical aliases. Filesystem conversion is explicit; a checkout rejects names its host cannot represent before replacing files.
+
+Release pins contain an immutable name, complete snapshot, and causal roots. Publication verifies that the roots derive exactly that committed snapshot. Equal names with different views remain distinct pins; lookup requires an exact view hash when ambiguous. Pins do not impose a global project head.
 
 Local schema migration preserves previous saved snapshots and archives old workspace metadata. Existing snapshot-only histories require an explicit new commit to enter transaction synchronization. Standalone remotes retain v0 endpoints for older clients; the transaction API does not reinterpret v0 revision history as transaction history.
 

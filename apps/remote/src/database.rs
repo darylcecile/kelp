@@ -262,6 +262,7 @@ mod tests {
                     blob,
                     size: bytes.len() as u64,
                     executable: false,
+                    kind: Default::default(),
                 },
             )]),
         };
