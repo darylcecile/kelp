@@ -1,0 +1,16 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "kelp-remote",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-25",
+  "compatibility_flags": ["nodejs_compat"],
+  "r2_buckets": [
+    { "binding": "OBJECTS", "bucket_name": "kelp-objects" }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "JOURNALS", "class_name": "Journal" }]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Journal"] }
+  ]
+}

@@ -16,11 +16,12 @@ The repository pins its Rust toolchain. SQLite is bundled; no separate database 
 ```text
 apps/cli          kelp          Native command-line client
 apps/remote       kelp-remote   Self-hosted HTTP service
+apps/remote-cloudflare          Cloudflare Worker remote (TypeScript)
 crates/kelp-core                Shared objects, protocol types, content storage
 PRD/                           Product and architecture proposal
 ```
 
-Both applications use Rust in one Cargo workspace. The shared object model keeps client and server revision rules aligned. The applications use Clap, Axum, and SQLite, with synchronous domain logic and a small HTTP layer.
+The native CLI and remote use Rust in one Cargo workspace. The shared object model keeps their revision rules aligned. The Cloudflare remote is a separate npm workspace using the same wire protocol; its integration tests exercise the actual Rust CLI against Wrangler's local runtime.
 
 ## Run the remote
 
@@ -40,6 +41,26 @@ curl http://127.0.0.1:8080/healthz
 ```
 
 See the [remote guide](apps/remote/README.md) for configuration, persistent storage, and API details.
+
+## Cloudflare remote
+
+Install Node.js 24+ and run from the repository root:
+
+```sh
+npm ci
+cp apps/remote-cloudflare/.dev.vars.example apps/remote-cloudflare/.dev.vars
+npm run dev --workspace @kelp/remote-cloudflare
+```
+
+Use `KELP_TOKEN=local-development-token` and `http://localhost:8787/my-project` with the CLI. Local state is kept in the Worker's ignored `.wrangler` directory. Change the local token in `.dev.vars` when needed; deployed tokens use a Wrangler secret.
+
+```sh
+npm run check --workspace @kelp/remote-cloudflare
+npm run build --workspace @kelp/remote-cloudflare
+npm test --workspace @kelp/remote-cloudflare
+```
+
+`build` is an offline deployment dry run. Tests build the Rust CLI and start isolated local R2/SQLite Durable Object storage. They check protocol rejection, atomic publication, real CLI large-file/sparse/conflict/tag workflows, and persistence across a Worker restart. Deployment instructions are in [the Cloudflare remote guide](apps/remote-cloudflare/README.md).
 
 ## Run the distributed proof
 

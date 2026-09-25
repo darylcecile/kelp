@@ -2,6 +2,8 @@
 
 The remote accepts immutable edit transactions. It can run as a single server, a stateless gateway, or a private storage node. Source builds and container startup commands are in [CONTRIBUTING.md](../../CONTRIBUTING.md#run-the-remote).
 
+To host a remote on Cloudflare instead, use [remote-cloudflare](../remote-cloudflare/README.md), which stores objects in R2 and journals in SQLite Durable Objects.
+
 ## Deployment modes
 
 | Mode | Configuration | Persistent state |

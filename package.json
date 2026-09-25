@@ -1,0 +1,6 @@
+{
+  "name": "kelp-workspace",
+  "private": true,
+  "workspaces": ["apps/remote-cloudflare"],
+  "engines": { "node": ">=24.0.0" }
+}

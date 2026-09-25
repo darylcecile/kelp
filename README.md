@@ -162,6 +162,7 @@ Kelp caches validated file state, compresses/batches object transfers, and can c
 Use `kelp --help` or `kelp <command> --help`. `--json` provides structured output and `-C PATH` selects a project directory.
 
 - [Remote operation and protocol](apps/remote/README.md)
+- [Deploy a remote on Cloudflare](apps/remote-cloudflare/README.md)
 - [Report a problem](https://github.com/darylcecile/kelp/issues)
 - [Development and source builds](CONTRIBUTING.md)
 - [Architecture and product specification](PRD/README.md)
