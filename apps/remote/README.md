@@ -51,6 +51,8 @@ SHA-256("kelp/0\0" + object-kind + "\0" + decimal-byte-length + "\0" + bytes)
 
 The `kelp/0` prefix versions the stable object envelope, not the transaction network protocol. Transactions additionally carry `format: 1` and use object kind `transaction`.
 
+The 0.0.3 CLI supports `clone --paths` against this same API, including 0.0.2 remotes. It retrieves complete transaction metadata but batches only selected paths' file blobs. Submitted commits retain the normal full-transaction validation rules; partial checkout is a client materialization/transfer policy, not path-level authorization.
+
 Batch info/download bodies are `{"objects":[{"kind":"blob","id":"<hash>"}]}`. Packs use `application/x-kelp-pack`: Zstandard-compressed `KLP1` framing, with a kind byte, 64-byte ASCII hash, four-byte big-endian length, and bytes per object. Packs are limited to 128 objects and 32 MiB decoded. Each hash is verified independently. Transaction publication stays separate from file uploads.
 
 Storage compresses beneficial objects with Zstandard level 1 while retaining their logical hashes and lengths. Existing uncompressed rows remain readable. Run matching CLI, gateway, and storage-node builds when using batch endpoints.

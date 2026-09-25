@@ -95,6 +95,8 @@ Add tests for behavior that could lose work or break interoperability. Coverage 
 
 The transaction protocol is `kelp/1`; the existing typed object-hash envelope remains stable so blob IDs can be reused. Changes to either require explicit compatibility decisions. Local schema upgrade preserves saved snapshots and archives old metadata; an explicit new commit introduces the desired files into transaction synchronization. Describe implemented behavior in the root README and future requirements in `PRD/`.
 
+Partial checkout selection lives in workspace metadata version 2. Full saved views retain their original encoding; scoped saved views use format 2 and include selected paths in their hash. Keep complete transaction metadata in the projection, and filter only file-blob requests, filesystem scans, and the edit frontier used by local commit. Tests in `apps/cli/tests/partial.rs` cover those boundaries.
+
 The file-stat and projection caches are rebuildable derived data, not saved user versions. Unix file reuse checks device/inode, size, mode, mtime, and ctime and rereads racy timestamps; other platforms conservatively reread content. Object indexes use binary hashes and interned namespace/kind IDs; payloads live separately in loose rows or bounded packs. The storage migration validates and preserves older raw/compressed objects. Do not use an older binary to open an upgraded database.
 
 `kelp gc` losslessly repacks objects and vacuums free pages. The remote's `--compact --data-dir PATH` option performs the same operation on a stopped storage node or standalone server. Packing never crosses a node or namespace. Deploy matching CLI/gateway/storage builds when using the batch endpoints.

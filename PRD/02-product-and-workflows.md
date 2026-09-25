@@ -19,7 +19,7 @@ Local-only projects omit the remote and push steps. A commit is deliberate; push
 | Command | Meaning |
 | --- | --- |
 | `init [DIR]` | Start a local project |
-| `clone URL [DIR]` | Download a project's transactions and create a clean view |
+| `clone URL [DIR] [--paths PATHS]` | Download transaction metadata and create a full or selected-path view |
 | `status` | Show uncommitted files, queued commits, and unresolved alternatives |
 | `diff` | Preview working-file edits against the current committed/pulled base |
 | `commit -m MESSAGE` | Save an atomic edit transaction and a local recovery view |
@@ -84,6 +84,23 @@ The resolution commit names both file parents, so replicas agree that both alter
 The prototype's choices are whole-file choices. Several different incoming alternatives may require keeping the local file, editing it manually, and committing the result. Richer per-file/text resolution is future work.
 
 A clean clone of a conflicted shared view currently stops with an explanation. An existing contributor must resolve and push before a clean clone is available. This is an explicit consequence of accepting conflicting contributions without a globally serialized clean-head gate.
+
+## Partial checkouts
+
+```sh
+kelp clone https://code.example.com/shop --paths services/api,libs/money
+cd shop
+kelp commit -m "Update selected services"
+kelp push
+```
+
+The clone persists a canonical set of project-relative files/directory prefixes. Prefix matching respects path boundaries: `services/api` does not select `services/api-old`. Commas and repeated `--paths` arguments combine selections; redundant child prefixes are collapsed. `--paths .` means a full clone.
+
+Complete transaction bodies and dependency metadata are retained. Only selected paths' historical file blobs are fetched. A commit computes edits from the selected file frontier; absent outside files do not become deletions. Pull retains the selection, including when a new remote commit changes selected and unselected paths atomically. Source conflicts entirely outside the selection do not block work; structural collisions affecting selected paths are still reported.
+
+Saved partial views include their path scope in their hash. Restore requires a matching scope and leaves outside files untouched. Inspection of a cross-directory commit marks excluded file bodies as not downloaded rather than omitting their metadata. A partial checkout can push its new commits to the original remote, which already holds their complete dependencies. Exporting those dependencies elsewhere can require uncached outside blobs and fails explicitly when they are missing.
+
+The selection is fixed for this release. Include root ignore/build configuration explicitly when needed. This is selective content replication, not metadata secrecy or a full project backup.
 
 ## Understand saved views versus shared commits
 

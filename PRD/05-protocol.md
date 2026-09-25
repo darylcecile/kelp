@@ -88,6 +88,8 @@ An empty cursor list starts discovery. Each storage journal returns at most 256 
 
 Transaction bodies may reference parents not listed in this particular page or observed journal prefix. The client fetches those parents recursively before validating/materializing the view. Duplicate and out-of-order delivery are harmless; incomplete closure is an error.
 
+With `clone --paths`, the client still obtains the complete transaction metadata closure, but requests file blobs only for selected paths. Selection is applied when building object batches, not by dropping edits from transaction bodies. Excluded blobs are intentionally absent locally; they are not deletions or corruption. Selected blobs are still hash/length checked. This is compatible with the existing v1 remote API and requires no new server-side filtering endpoint.
+
 Cursors are saved after a successful local synchronization. A conflict that stops pull does not advance them past unincorporated work.
 
 ## Conflicts and resolution
@@ -96,7 +98,7 @@ Push can accept concurrent conflicting transactions because both are valid indep
 
 `pull --keep-local` or `--keep-remote` selects draft file contents in an existing workspace. `commit` records the actual resolution, with every competing file parent in its edit. Until that transaction is included, the shared view remains conflicted.
 
-The prototype refuses a clean clone of an unresolved view. An existing contributor can resolve it and push the resolution. Selecting an arbitrary historical view during clone and richer conflict browsing are later UI work.
+The prototype refuses a clean clone when conflicts affect its selected paths, including structural collisions across the selection boundary. Conflicts entirely outside a partial selection remain in the retained metadata without blocking that checkout. An existing contributor can resolve affected conflicts and push the resolution. Selecting an arbitrary historical view during clone and richer conflict browsing are later UI work.
 
 ## Private storage API
 

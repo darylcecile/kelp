@@ -336,6 +336,35 @@ async fn one_project_spans_three_stores_and_two_stateless_gateways() -> anyhow::
         |row| row.get(0),
     )?;
     assert_eq!(entries, 1);
+    cli(
+        root.path(),
+        &[
+            "clone",
+            &format!("{expanded}/demo"),
+            "partial",
+            "--paths",
+            "batch/0/api",
+        ],
+    );
+    let partial = root.path().join("partial");
+    assert!(!partial.join("batch/0/caller").exists());
+    assert!(!partial.join("alice.txt").exists());
+    fs::write(
+        partial.join("batch/0/api"),
+        b"partial edit across sharded storage",
+    )?;
+    cli(&partial, &["commit", "-m", "Edit selected file"]);
+    cli(&partial, &["push"]);
+    let full = root.path().join("expanded-copy");
+    cli(&full, &["pull"]);
+    assert_eq!(
+        fs::read(full.join("batch/0/api"))?,
+        b"partial edit across sharded storage"
+    );
+    assert_eq!(
+        fs::read(full.join("batch/0/caller"))?,
+        b"partitioned payload 0"
+    );
     println!(
         "expanded the same project to 4 stores; old commits remained readable and the new store accepted a write"
     );

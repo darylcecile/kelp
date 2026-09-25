@@ -17,6 +17,7 @@ use reqwest::{
 };
 
 use crate::index::Projection;
+use crate::selection;
 use crate::workspace::{Resolution, Workspace, merge_snapshots};
 
 pub struct Remote {
@@ -203,7 +204,7 @@ impl Remote {
                 &workspace.state.project,
                 &info.object.kind,
                 &info.object.id,
-            )?;
+            ).with_context(|| "required content is not cached; a partial checkout can push new commits to its original remote, but cannot copy missing outside-path history to a different remote")?;
             if objects.len() == transfer::MAX_OBJECTS
                 || total + bytes.len() + 69 > transfer::MAX_PACK_BYTES
             {
@@ -358,8 +359,9 @@ impl Remote {
                     todo.extend(transaction.dependencies().difference(&seen).cloned());
                     for value in transaction
                         .edits
-                        .values()
-                        .filter_map(|edit| edit.value.as_ref())
+                        .iter()
+                        .filter(|(path, _)| workspace.includes(path))
+                        .filter_map(|(_, edit)| edit.value.as_ref())
                     {
                         if !storage::contains(
                             &workspace.db,
@@ -385,8 +387,9 @@ impl Remote {
         for transaction in graph.transactions.values() {
             for entry in transaction
                 .edits
-                .values()
-                .filter_map(|edit| edit.value.as_ref())
+                .iter()
+                .filter(|(path, _)| workspace.includes(path))
+                .filter_map(|(_, edit)| edit.value.as_ref())
             {
                 ensure!(
                     storage::size(&workspace.db, &workspace.state.project, "blob", &entry.blob)?
@@ -405,6 +408,17 @@ impl Remote {
         project_name: &str,
         destination: &Path,
     ) -> Result<Workspace> {
+        self.clone_paths(base, project_name, destination, Vec::new())
+    }
+
+    pub fn clone_paths(
+        &self,
+        base: &str,
+        project_name: &str,
+        destination: &Path,
+        paths: Vec<String>,
+    ) -> Result<Workspace> {
+        let paths = selection::normalize(paths)?;
         let project = self.project(false)?;
         ensure!(
             std::fs::symlink_metadata(destination).is_err(),
@@ -418,8 +432,12 @@ impl Remote {
         let staging = tempfile::tempdir_in(parent)?;
         let checkout = staging.path().join("checkout");
         let mut workspace = Workspace::init(&checkout, project_name, Some(normalize_url(base)?))?;
+        workspace.state.paths = paths;
+        if !workspace.state.paths.is_empty() {
+            workspace.state.version = 2;
+        }
         let (graph, projection, cursors, _) = self.fetch(&workspace, &project)?;
-        let snapshot = projection.view.snapshot().context("the remote contains conflicting commits; an existing contributor must resolve them with pull, commit, and push before a clean clone is available")?;
+        let snapshot = workspace.checkout_view(&projection.view)?.snapshot().context("the selected paths contain conflicting commits; an existing contributor must resolve them with pull, commit, and push before a clean clone is available")?;
         workspace.apply_snapshot(&Snapshot::default(), &snapshot)?;
         workspace.state.transactions = graph.transactions.keys().cloned().collect();
         workspace.cache_projection(&projection)?;
@@ -450,7 +468,7 @@ impl Remote {
         }
         let base = workspace.baseline()?;
         let incoming = select_snapshot(
-            &projection.view,
+            &workspace.checkout_view(&projection.view)?,
             &workspace.state.transactions,
             &base,
             resolution,

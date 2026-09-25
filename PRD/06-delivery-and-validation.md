@@ -86,6 +86,8 @@ Storage compaction qualification additionally checks every preserved object hash
 
 The compaction implementation passes the 30-test workspace suite plus the added incompressible-group budget test. Its maintained footprint on the 1,000-file/101-commit fixture is 323,584 bytes, compared with Git's 330,148 bytes. Kelp retains all logical objects and recovery events; GC only changes physical representation. Post-maintenance status is 20.6 ms median versus 18.0 ms before maintenance; historical show is 12.8 ms. The [raw measurement](../benchmarks/results/compacted.json) and [method](../benchmarks/README.md) record the tradeoffs and limit the size claim to this fixture.
 
+Partial-checkout qualification covers selected-only blob transfer, full cross-directory transaction metadata, selected additions/deletions, outside-file preservation during push/pull/restore, remembered multiple-path selections, excluded versus relevant conflicts, scope-bound saved-view hashes, and explicit failure when an export requires uncached dependency blobs. Full metadata retrieval remains a known scaling cost; file-payload savings are not a claim of metadata-sparse cloning.
+
 ## Compatibility and adoption
 
 Existing local saved snapshots remain recoverable during schema upgrade; old metadata is archived. Recommit the desired state to enter transaction synchronization. Standalone v0 endpoints remain available for existing clients, but v0 history is not automatically promoted into v1 transactions.

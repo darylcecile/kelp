@@ -319,6 +319,10 @@ pub struct SavedView {
     pub format: u32,
     pub snapshot: String,
     pub roots: BTreeSet<String>,
+    /// Format 2 is a scoped checkout; omitted on full format-1 views so their
+    /// existing hashes remain unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
 }
 
 impl SavedView {

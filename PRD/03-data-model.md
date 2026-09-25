@@ -115,6 +115,14 @@ Cloning records a local view of the downloaded transaction set. Its transaction 
 
 A saved-view object contains `format`, `snapshot`, and a sorted `roots` set. Its typed hash identifies exact files plus causal context. This differs from the transaction-set view ID, which can identify a conflicted graph or a graph whose unfinished working edits have not been committed. Local timestamps/messages describe history events without changing the saved-view object's hash. Older snapshot-only records migrate with empty roots because their causal set was not recorded.
 
+### Selected-path views
+
+Full saved views retain format 1 and their existing byte encoding/hashes. A partial saved view uses format 2 and additionally records a canonical `paths` list. Its snapshot contains only those paths, while its roots preserve the complete known transaction context. It does not claim that excluded file contents are present locally or that excluded conflicts are resolved.
+
+Partial workspace metadata uses version 2 so older clients cannot mistake excluded paths for deletions. An empty selection means the complete project; otherwise every scan, commit, checkout, and restore is restricted to the selected path prefixes. The global file frontier remains complete in metadata. Only the selected frontier is compared with working files when constructing a new transaction.
+
+This keeps atomic cross-directory transactions intact: their metadata is not rewritten into smaller transactions. The client may lack excluded blobs, and it must never substitute empty bytes for them. New partial commits push normally to a remote that already has their dependencies. A clone to another remote must obtain any missing outside-path dependency contents before those old transactions can be published there.
+
 ## Derived indexes and physical compression
 
 The local projection cache stores current file alternatives and transaction roots. Status and commit load that cached frontier instead of rehashing and replaying transaction bodies. New commits and downloaded additions update it incrementally in dependency order. A membership fingerprint and payload checksum reject stale/corrupt cache records; rebuilding uses authoritative transactions.

@@ -39,6 +39,9 @@ enum Commands {
         url: String,
         /// Destination directory (defaults to the project name).
         path: Option<PathBuf>,
+        /// Download only these project-relative files/directories (comma-separated or repeated).
+        #[arg(long, value_delimiter = ',')]
+        paths: Vec<String>,
     },
     /// Show uncommitted files and commits ready to push.
     Status,
@@ -181,15 +184,26 @@ fn run(cli: Cli) -> Result<()> {
                 ),
             )
         }
-        Commands::Clone { url, path } => {
+        Commands::Clone { url, path, paths } => {
             let (base, project) = project_location(&url)?;
             let remote = Remote::new(&base, &project, token()?)?;
             let destination = directory.join(path.unwrap_or_else(|| PathBuf::from(&project)));
-            let workspace = remote.clone_project(&base, &project, &destination)?;
+            let workspace = remote.clone_paths(&base, &project, &destination, paths)?;
             emit(
                 cli.json,
-                &serde_json::json!({"project": project, "directory": workspace.root, "remote": location(&workspace)}),
-                format!("Cloned {project} into {}.", workspace.root.display()),
+                &serde_json::json!({"project": project, "directory": workspace.root, "remote": location(&workspace), "paths": workspace.state.paths}),
+                format!(
+                    "Cloned {project} into {}.{}",
+                    workspace.root.display(),
+                    if workspace.state.paths.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "\nSelected paths: {}. Other file contents were not downloaded.",
+                            workspace.state.paths.join(", ")
+                        )
+                    }
+                ),
             )
         }
         command => {
@@ -203,6 +217,9 @@ fn run(cli: Cli) -> Result<()> {
                         status.project,
                         status.remote.as_deref().unwrap_or("local only")
                     );
+                    if !status.paths.is_empty() {
+                        text.push_str(&format!("Selected paths: {}\n", status.paths.join(", ")));
+                    }
                     if let Some(version) = &status.version {
                         text.push_str(&format!(
                             "Last saved view: {}\n",
@@ -246,7 +263,7 @@ fn run(cli: Cli) -> Result<()> {
                         cli.json,
                         &version,
                         format!(
-                            "Commit {}: {message}\nSaved view {} — use this hash to restore the complete project.",
+                            "Commit {}: {message}\nSaved view {} — use this hash to restore this checkout.",
                             workspace.short_hash(
                                 version
                                     .transaction

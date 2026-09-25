@@ -2,4 +2,5 @@
 
 mod index;
 pub mod remote;
+mod selection;
 pub mod workspace;

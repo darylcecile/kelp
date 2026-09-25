@@ -7,12 +7,13 @@ use std::{
 };
 
 use crate::index::{self, Projection};
+use crate::selection;
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use ignore::WalkBuilder;
 use kelp_core::{
     FileEntry, MAX_BLOB_BYTES, MAX_METADATA_BYTES, Snapshot, storage,
-    transactions::{Graph, SavedView, Transaction},
+    transactions::{Graph, SavedView, Transaction, View},
     validate_name, validate_path,
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -34,6 +35,8 @@ pub struct WorkspaceState {
     pub cursors: Vec<i64>,
     #[serde(default)]
     pub layout: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -56,6 +59,7 @@ pub struct Status {
     pub changed: Vec<String>,
     pub conflicts: BTreeSet<String>,
     pub version: Option<String>,
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,6 +141,7 @@ impl Workspace {
             outbox: BTreeSet::new(),
             cursors: Vec::new(),
             layout: None,
+            paths: Vec::new(),
         };
         let workspace = Self {
             root,
@@ -169,9 +174,17 @@ impl Workspace {
         let bytes = storage::decode_record(&encoded)?;
         let mut state: WorkspaceState = serde_json::from_slice(&bytes)?;
         ensure!(
-            state.version <= 1,
+            state.version <= 2,
             "unsupported workspace version {}",
             state.version
+        );
+        ensure!(
+            selection::normalize(state.paths.clone())? == state.paths,
+            "invalid checkout path selection"
+        );
+        ensure!(
+            state.paths.is_empty() || state.version == 2,
+            "partial checkout requires workspace format 2"
         );
         let columns = db
             .prepare("PRAGMA table_info(checkpoints)")?
@@ -229,6 +242,7 @@ impl Workspace {
                     format: 1,
                     snapshot,
                     roots: BTreeSet::new(),
+                    paths: Vec::new(),
                 };
                 let hash = storage::put_json(&tx, &self.state.project, "saved-view", &view)?;
                 tx.execute(
@@ -402,9 +416,10 @@ impl Workspace {
 
     pub fn remember_snapshot(&self, snapshot: String, message: Option<&str>) -> Result<Checkpoint> {
         let view = SavedView {
-            format: 1,
+            format: if self.state.paths.is_empty() { 1 } else { 2 },
             snapshot: snapshot.clone(),
             roots: self.projection()?.roots,
+            paths: self.state.paths.clone(),
         };
         let hash = storage::put_json(&self.db, &self.state.project, "saved-view", &view)?;
         let created_at = now();
@@ -510,6 +525,13 @@ impl Workspace {
             .collect::<Result<BTreeMap<_, _>>>()?;
         let mut result = Vec::new();
         for (path, edit) in &transaction.edits {
+            if !self.includes(path) {
+                result.push(FileDiff {
+                    file: FileChange { path: path.clone(), kind: "not downloaded" },
+                    diff: "Outside this checkout's path selection. The complete commit metadata is retained.\n".into(),
+                });
+                continue;
+            }
             let mut after = Snapshot::default();
             if let Some(value) = &edit.value {
                 after.files.insert(path.clone(), value.clone());
@@ -616,8 +638,14 @@ impl Workspace {
             view: projection.id()?,
             pending_commits: self.state.outbox.len(),
             changed,
-            conflicts: projection.view.conflicts(),
+            conflicts: projection
+                .view
+                .conflicts()
+                .into_iter()
+                .filter(|path| self.includes(path))
+                .collect(),
             version: latest.map(|c| c.view),
+            paths: self.state.paths.clone(),
         })
     }
 
@@ -643,10 +671,11 @@ impl Workspace {
         let mut projection = self.projection()?;
         let tx = self.db.unchecked_transaction()?;
         let snapshot = self.scan(Some(&tx))?;
-        let transaction =
-            projection
-                .view
-                .record(&snapshot, message.into(), Uuid::new_v4().to_string())?;
+        let transaction = self.selected_view(&projection.view).record(
+            &snapshot,
+            message.into(),
+            Uuid::new_v4().to_string(),
+        )?;
         let bytes = serde_json::to_vec(&transaction)?;
         ensure!(
             bytes.len() <= MAX_METADATA_BYTES,
@@ -708,6 +737,48 @@ impl Workspace {
         )
     }
 
+    pub fn includes(&self, path: &str) -> bool {
+        selection::includes(&self.state.paths, path)
+    }
+
+    pub fn selected_view(&self, view: &View) -> View {
+        View {
+            files: view
+                .files
+                .iter()
+                .filter(|(path, _)| self.includes(path))
+                .map(|(path, heads)| (path.clone(), heads.clone()))
+                .collect(),
+        }
+    }
+
+    pub fn checkout_view(&self, view: &View) -> Result<View> {
+        let selected = self.selected_view(view);
+        let local_conflicts = selected.conflicts();
+        let external: Vec<_> = view
+            .conflicts()
+            .into_iter()
+            .filter(|path| self.includes(path) && !local_conflicts.contains(path))
+            .collect();
+        ensure!(
+            external.is_empty(),
+            "selected paths collide with files outside the checkout: {}",
+            external.join(", ")
+        );
+        Ok(selected)
+    }
+
+    fn selected_snapshot(&self, snapshot: &Snapshot) -> Snapshot {
+        Snapshot {
+            files: snapshot
+                .files
+                .iter()
+                .filter(|(path, _)| self.includes(path))
+                .map(|(path, file)| (path.clone(), file.clone()))
+                .collect(),
+        }
+    }
+
     fn scan(&self, store: Option<&Connection>) -> Result<Snapshot> {
         let transaction = if store.is_none() {
             Some(self.db.unchecked_transaction()?)
@@ -724,12 +795,13 @@ impl Workspace {
             .map(|saved| self.checkpoint_snapshot(saved.id))
             .transpose()?
             .unwrap_or_default();
-        let mut paths = discover_files(&self.root)?;
+        let mut paths = discover_selected_files(&self.root, &self.state.paths)?;
         paths.extend(self.state.tracked.iter().cloned());
         paths.extend(self.baseline()?.files.into_keys());
         if let Some(last) = self.checkpoints(1)?.pop() {
             paths.extend(self.checkpoint_snapshot(last.id)?.files.into_keys());
         }
+        paths.retain(|path| self.includes(path));
         let mut files = BTreeMap::new();
         let mut missing = Vec::new();
         let mut cache_updates = BTreeMap::new();
@@ -914,6 +986,10 @@ impl Workspace {
         );
         let view: SavedView =
             storage::get_json(&self.db, &self.state.project, "saved-view", &hash)?;
+        ensure!(
+            matches!(view.format, 1 | 2) && view.paths == self.state.paths,
+            "this saved view covers a different path selection; restore it in a checkout with the same selection"
+        );
         let target = storage::get_json(&self.db, &self.state.project, "snapshot", &view.snapshot)?;
         let backup = self.capture(Some(&format!(
             "Before restoring {}",
@@ -953,6 +1029,9 @@ impl Workspace {
     /// Apply verified file bytes in place, retaining ignored files and .kelp.
     /// The caller records the current snapshot before replacing any files.
     pub fn apply_snapshot(&self, current: &Snapshot, target: &Snapshot) -> Result<()> {
+        let selected_current = self.selected_snapshot(current);
+        let selected_target = self.selected_snapshot(target);
+        let (current, target) = (&selected_current, &selected_target);
         storage::verify_snapshot(&self.db, &self.state.project, target)?;
         // Check the target's names on this filesystem before changing real files.
         let shape = tempfile::tempdir_in(self.root.join(".kelp"))?;
@@ -1093,8 +1172,14 @@ fn lock_workspace(root: &Path) -> Result<File> {
 }
 
 pub fn discover_files(root: &Path) -> Result<BTreeSet<String>> {
+    discover_selected_files(root, &[])
+}
+
+fn discover_selected_files(root: &Path, paths: &[String]) -> Result<BTreeSet<String>> {
     let mut files = BTreeSet::new();
     let mut walker = WalkBuilder::new(root);
+    let selected = paths.to_vec();
+    let directory = root.to_owned();
     walker
         .hidden(false)
         .require_git(false)
@@ -1102,7 +1187,28 @@ pub fn discover_files(root: &Path) -> Result<BTreeSet<String>> {
         .git_global(false)
         .follow_links(false)
         .add_custom_ignore_filename(".kelpignore")
-        .filter_entry(|entry| !matches!(entry.file_name().to_str(), Some(".kelp" | ".git")));
+        .filter_entry(move |entry| {
+            if matches!(entry.file_name().to_str(), Some(".kelp" | ".git")) {
+                return false;
+            }
+            if entry.depth() == 0 || selected.is_empty() {
+                return true;
+            }
+            let Some(path) = entry
+                .path()
+                .strip_prefix(&directory)
+                .ok()
+                .and_then(|path| path.to_str())
+            else {
+                return false;
+            };
+            let path = path.replace(std::path::MAIN_SEPARATOR, "/");
+            if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                selection::intersects(&selected, &path)
+            } else {
+                selection::includes(&selected, &path)
+            }
+        });
     for entry in walker.build() {
         let entry = entry?;
         if entry.file_type().is_some_and(|kind| kind.is_dir()) {
